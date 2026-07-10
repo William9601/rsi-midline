@@ -1,18 +1,17 @@
 {
   "_readme": "Tuned per-timeframe defaults, applied automatically based on TIMEFRAME. Anything set explicitly in .env or the shell overrides these. Run 'python rsi_midline_bot.py tune' to re-tune with walk-forward validation (it updates this file only if the winner holds up out-of-sample), or edit by hand and update 'tuned'/'notes' so the evidence stays with the numbers.",
-
   "1Day": {
     "tuned": "2026-07-10",
-    "status": "backtested",
-    "notes": "3y backtest (2023-07 to 2026-07, SPY/AAPL/MSFT): plain RSI-50 cross was best (+48%/+46%/+23%). Band 55/45 and MA200 both reduced returns in this period. Volume filter far too strict on daily bars (2-6 trades in 3y, killed returns) - daily crosses rarely land on 1.5x volume days. Loop mode evaluates once per day, 10 min before close, so POLL_SECONDS barely matters.",
+    "status": "backtested (walk-forward)",
+    "notes": "Auto-tuned on QQQ,GLD,IWM,SPY over 1095d of 1Day bars, 70%/30% walk-forward split. Train avg +36.7%, out-of-sample test avg +19.3% vs buy&hold +24.0% on the test window (11 test trades). Grid: bands [(50, 50), (55, 45), (60, 40)], MA [0, 50, 200], vol [0, 1.5, 2.0].",
     "settings": {
-      "RSI_BUY_LEVEL": "50",
-      "RSI_SELL_LEVEL": "50",
-      "TREND_MA_PERIOD": "0",
-      "VOLUME_MULT": "0"
+      "RSI_BUY_LEVEL": "60",
+      "RSI_SELL_LEVEL": "40",
+      "TREND_MA_PERIOD": "50",
+      "VOLUME_MULT": "0",
+      "VOLUME_LOOKBACK": "20"
     }
   },
-
   "1Hour": {
     "tuned": "2026-07-10",
     "status": "not backtested - inherited from 15Min findings",
@@ -26,7 +25,6 @@
       "POLL_SECONDS": "1800"
     }
   },
-
   "15Min": {
     "tuned": "2026-07-10",
     "status": "backtested",
@@ -40,7 +38,6 @@
       "POLL_SECONDS": "450"
     }
   },
-
   "5Min": {
     "tuned": "2026-07-10",
     "status": "not backtested - inherited from 15Min findings",
@@ -54,7 +51,6 @@
       "POLL_SECONDS": "150"
     }
   },
-
   "1Min": {
     "tuned": "2026-07-10",
     "status": "not recommended",
