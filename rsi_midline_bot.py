@@ -15,13 +15,19 @@ Usage:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sys
 import time
+import warnings
+
+# macOS system Python links against LibreSSL; the warning is harmless noise.
+warnings.filterwarnings("ignore", message="urllib3 v2 only supports OpenSSL")
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
+import numpy as np
 import pandas as pd
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
@@ -58,6 +64,29 @@ def load_dotenv() -> None:
                 os.environ[key] = value
 
 
+def apply_profile(timeframe: str) -> None:
+    """Fill in tuned per-timeframe defaults from profiles.json.
+
+    Settings already present in the environment (shell or .env) always win,
+    so a profile only supplies the knobs you haven't set yourself.
+    """
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "profiles.json")
+    if not os.path.exists(path):
+        return
+    with open(path) as f:
+        profile = json.load(f).get(timeframe)
+    if not profile:
+        log.warning("No profile for timeframe %s in profiles.json", timeframe)
+        return
+    applied = {k: v for k, v in profile.get("settings", {}).items()
+               if k not in os.environ}
+    for key, value in applied.items():
+        os.environ[key] = str(value)
+    log.info("Profile %s (%s, tuned %s): applied %s",
+             timeframe, profile.get("status", "?"), profile.get("tuned", "?"),
+             applied or "nothing (all set explicitly)")
+
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -84,6 +113,18 @@ class Config:
     timeframe: str = field(default_factory=lambda: os.environ.get("TIMEFRAME", "15Min"))
     rsi_period: int = field(default_factory=lambda: int(os.environ.get("RSI_PERIOD", "14")))
     midline: float = field(default_factory=lambda: float(os.environ.get("MIDLINE", "50")))
+    # Band variant: buy above RSI_BUY_LEVEL, sell below RSI_SELL_LEVEL.
+    # Both default to the midline (plain crossover strategy).
+    rsi_buy: float = field(default_factory=lambda: float(
+        os.environ.get("RSI_BUY_LEVEL", os.environ.get("MIDLINE", "50"))))
+    rsi_sell: float = field(default_factory=lambda: float(
+        os.environ.get("RSI_SELL_LEVEL", os.environ.get("MIDLINE", "50"))))
+    # Trend filter: only buy when price is above this moving average (0 = off).
+    trend_ma: int = field(default_factory=lambda: int(os.environ.get("TREND_MA_PERIOD", "0")))
+    # Volume filter: only buy when the signal bar's volume is at least this
+    # multiple of the recent average (0 = off).
+    vol_mult: float = field(default_factory=lambda: float(os.environ.get("VOLUME_MULT", "0")))
+    vol_lookback: int = field(default_factory=lambda: int(os.environ.get("VOLUME_LOOKBACK", "20")))
     # Dollar amount per new position.
     notional: float = field(default_factory=lambda: float(os.environ.get("NOTIONAL", "1000")))
     # Seconds between checks in loop mode.
@@ -107,14 +148,22 @@ def rsi(close: pd.Series, period: int = 14) -> pd.Series:
     return 100 - (100 / (1 + rs))
 
 
-def crossover_signal(rsi_series: pd.Series, midline: float) -> str | None:
-    """Return 'buy'/'sell' if RSI crossed the midline on the latest bar."""
+def crossover_signal(
+    rsi_series: pd.Series, buy_level: float, sell_level: float | None = None
+) -> str | None:
+    """Return 'buy'/'sell' if RSI crossed a level on the latest bar.
+
+    With buy_level == sell_level this is the plain midline crossover; with
+    e.g. 55/45 it becomes a band that ignores wobbles around the middle.
+    """
+    if sell_level is None:
+        sell_level = buy_level
     if len(rsi_series) < 2 or rsi_series.iloc[-2:].isna().any():
         return None
     prev, curr = rsi_series.iloc[-2], rsi_series.iloc[-1]
-    if prev <= midline < curr:
+    if prev <= buy_level < curr:
         return "buy"
-    if prev >= midline > curr:
+    if prev >= sell_level > curr:
         return "sell"
     return None
 
@@ -142,23 +191,22 @@ class RsiMidlineBot:
         )
         return self.data.get_stock_bars(req).df
 
-    def closed_bars(self, symbol: str, bars: pd.DataFrame) -> pd.Series | None:
-        """Closing prices for one symbol, dropping the still-forming last bar."""
+    def closed_bars(self, symbol: str, bars: pd.DataFrame) -> pd.DataFrame | None:
+        """Bars for one symbol, dropping the still-forming last bar."""
         try:
             df = bars.xs(symbol, level="symbol")
         except KeyError:
             return None
-        closes = df["close"]
         # For intraday timeframes the most recent bar may still be forming;
         # drop it so signals only fire on completed bars.
         if self.timeframe.unit != TimeFrameUnit.Day:
             bar_len = timedelta(minutes=self.timeframe.amount_value) \
                 if self.timeframe.unit == TimeFrameUnit.Minute \
                 else timedelta(hours=self.timeframe.amount_value)
-            last_start = closes.index[-1]
+            last_start = df.index[-1]
             if datetime.now(timezone.utc) < last_start + bar_len:
-                closes = closes.iloc[:-1]
-        return closes
+                df = df.iloc[:-1]
+        return df
 
     # -- trading ------------------------------------------------------------
 
@@ -196,30 +244,64 @@ class RsiMidlineBot:
         if not clock.is_open:
             log.info("Market closed (next open %s), skipping pass", clock.next_open)
             return
-        # Enough history to warm up the RSI regardless of timeframe.
-        bars = self.fetch_bars(self.cfg.symbols, days=30 if self.timeframe.unit != TimeFrameUnit.Day else 200)
+        # Enough history to warm up the RSI and trend MA regardless of timeframe.
+        if self.timeframe.unit == TimeFrameUnit.Day:
+            days = max(200, int((self.cfg.trend_ma + self.cfg.rsi_period) * 1.6) + 30)
+        else:
+            days = 60 if self.cfg.trend_ma else 30
+        bars = self.fetch_bars(self.cfg.symbols, days=days)
         for symbol in self.cfg.symbols:
             symbol = symbol.strip().upper()
-            closes = self.closed_bars(symbol, bars)
-            if closes is None or len(closes) < self.cfg.rsi_period + 2:
+            df = self.closed_bars(symbol, bars)
+            if df is None or len(df) < self.cfg.rsi_period + 2:
                 log.warning("%s: not enough data, skipping", symbol)
                 continue
+            closes = df["close"]
             r = rsi(closes, self.cfg.rsi_period)
-            signal = crossover_signal(r, self.cfg.midline)
+            signal = crossover_signal(r, self.cfg.rsi_buy, self.cfg.rsi_sell)
+            if signal == "buy" and self.cfg.vol_mult:
+                # Volume on the signal bar vs the average of the bars before it.
+                avg_vol = df["volume"].shift(1).rolling(self.cfg.vol_lookback).mean().iloc[-1]
+                rvol = df["volume"].iloc[-1] / avg_vol if avg_vol else float("nan")
+                if not rvol >= self.cfg.vol_mult:
+                    log.info("%s: buy signal vetoed by volume filter (rvol %.2f < %.2f)",
+                             symbol, rvol, self.cfg.vol_mult)
+                    signal = None
+            if signal == "buy" and self.cfg.trend_ma:
+                ma = closes.rolling(self.cfg.trend_ma).mean().iloc[-1]
+                if pd.isna(ma) or closes.iloc[-1] <= ma:
+                    log.info("%s: buy signal vetoed by trend filter (price %.2f <= MA%d %.2f)",
+                             symbol, closes.iloc[-1], self.cfg.trend_ma, ma)
+                    signal = None
             log.info("%s: RSI=%.1f signal=%s", symbol, r.iloc[-1], signal or "none")
             if signal == "buy":
                 self.enter(symbol)
             elif signal == "sell":
                 self.exit(symbol)
 
+    def seconds_until_daily_eval(self) -> float:
+        """Time until the daily-bar evaluation window (10 min before close)."""
+        clock = self.trading.get_clock()
+        target = clock.next_close - timedelta(minutes=10)
+        return (target - clock.timestamp).total_seconds()
+
     def run_loop(self) -> None:
         log.info(
-            "Starting loop: symbols=%s timeframe=%s RSI(%d) midline=%.0f paper=%s",
+            "Starting loop: symbols=%s timeframe=%s RSI(%d) buy/sell=%.0f/%.0f paper=%s",
             self.cfg.symbols, self.cfg.timeframe, self.cfg.rsi_period,
-            self.cfg.midline, self.cfg.paper,
+            self.cfg.rsi_buy, self.cfg.rsi_sell, self.cfg.paper,
         )
         while True:
             try:
+                if self.timeframe.unit == TimeFrameUnit.Day:
+                    # Daily bars: evaluate once per day just before the close,
+                    # when the bar is nearly complete. Sleeping through the
+                    # rest of the day avoids trading a half-formed bar.
+                    wait = self.seconds_until_daily_eval()
+                    if wait > 0:
+                        log.info("Daily timeframe: next evaluation in %.1f hours "
+                                 "(10 min before market close)", wait / 3600)
+                        time.sleep(wait)
                 self.run_once()
             except KeyboardInterrupt:
                 raise
@@ -229,46 +311,77 @@ class RsiMidlineBot:
 
     # -- backtest -------------------------------------------------------------
 
+    def simulate(
+        self,
+        df: pd.DataFrame,
+        buy_level: float,
+        sell_level: float,
+        ma_period: int,
+        vol_mult: float = 0,
+    ) -> tuple[int, float, float]:
+        """Simulate one variant; returns (trades, win rate %, total return %).
+
+        In the market from the bar after RSI crosses above buy_level until the
+        bar after it crosses below sell_level (signals act on the next bar).
+        """
+        closes = df["close"]
+        r = rsi(closes, self.cfg.rsi_period)
+        cross_up = (r > buy_level) & (r.shift(1) <= buy_level)
+        cross_down = (r < sell_level) & (r.shift(1) >= sell_level)
+        if ma_period:
+            cross_up &= closes > closes.rolling(ma_period).mean()
+        if vol_mult:
+            avg_vol = df["volume"].shift(1).rolling(self.cfg.vol_lookback).mean()
+            cross_up &= df["volume"] >= avg_vol * vol_mult
+        state = pd.Series(np.nan, index=closes.index)
+        state[cross_up] = 1.0
+        state[cross_down] = 0.0
+        in_market = state.ffill().fillna(0).shift(1, fill_value=0).astype(bool)
+        bar_returns = closes.pct_change().fillna(0)
+        total = ((1 + bar_returns * in_market).prod() - 1) * 100
+        # Group consecutive in-market bars into trades for the win rate.
+        grp = (in_market != in_market.shift()).cumsum()
+        trade_returns = (1 + bar_returns[in_market]).groupby(grp[in_market]).prod() - 1
+        trades = len(trade_returns)
+        win_rate = float((trade_returns > 0).mean() * 100) if trades else 0.0
+        return trades, win_rate, total
+
     def backtest(self) -> None:
+        log.info(
+            "Fetching %d days of %s bars for %s — this can take a minute...",
+            self.cfg.backtest_days, self.cfg.timeframe, ",".join(self.cfg.symbols),
+        )
         bars = self.fetch_bars(self.cfg.symbols, days=self.cfg.backtest_days)
-        print(f"\nBacktest: RSI({self.cfg.rsi_period}) midline={self.cfg.midline} "
-              f"timeframe={self.cfg.timeframe}, last {self.cfg.backtest_days} days\n")
-        header = f"{'symbol':<8}{'trades':>7}{'win %':>8}{'strategy %':>12}{'buy&hold %':>12}"
-        print(header)
-        print("-" * len(header))
+        log.info("Fetched %d bars", len(bars))
+        m = self.cfg.midline
+        vm = self.cfg.vol_mult or 1.5
+        variants = [
+            (f"RSI {m:g} cross", m, m, 0, 0),
+            ("Band 55/45", 55, 45, 0, 0),
+            (f"RSI {m:g} + MA200", m, m, 200, 0),
+            (f"RSI {m:g} + vol x{vm:g}", m, m, 0, vm),
+            (f"Band + vol x{vm:g}", 55, 45, 0, vm),
+            (f"Band + vol + MA200", 55, 45, 200, vm),
+        ]
+        print(f"\nBacktest: RSI({self.cfg.rsi_period}), timeframe={self.cfg.timeframe}, "
+              f"last {self.cfg.backtest_days} days\n(MA200 = 200 bars of this timeframe; "
+              f"vol = signal-bar volume vs {self.cfg.vol_lookback}-bar average)")
         for symbol in self.cfg.symbols:
             symbol = symbol.strip().upper()
             try:
-                closes = bars.xs(symbol, level="symbol")["close"]
+                df = bars.xs(symbol, level="symbol")
             except KeyError:
-                print(f"{symbol:<8}  no data")
+                print(f"\n{symbol}: no data")
                 continue
-            r = rsi(closes, self.cfg.rsi_period)
-            above = r > self.cfg.midline
-            # In the market from the bar after a cross above until the bar
-            # after a cross below (signals act on the next bar's move).
-            in_market = above.shift(1, fill_value=False)
-            bar_returns = closes.pct_change().fillna(0)
-            strat_curve = (1 + bar_returns * in_market).cumprod()
-            hold_curve = (1 + bar_returns).cumprod()
-
-            entries = above & ~above.shift(1, fill_value=False)
-            trades = int(entries.sum())
-            # Per-trade returns for win rate
-            wins = 0
-            entry_price = None
-            for i in range(1, len(closes)):
-                if above.iloc[i - 1] and entry_price is None:
-                    entry_price = closes.iloc[i]
-                elif not above.iloc[i - 1] and entry_price is not None:
-                    if closes.iloc[i] > entry_price:
-                        wins += 1
-                    entry_price = None
-            closed = trades - (1 if entry_price is not None else 0)
-            win_rate = (wins / closed * 100) if closed else 0.0
-            print(f"{symbol:<8}{trades:>7}{win_rate:>7.1f}%"
-                  f"{(strat_curve.iloc[-1] - 1) * 100:>11.1f}%"
-                  f"{(hold_curve.iloc[-1] - 1) * 100:>11.1f}%")
+            closes = df["close"]
+            hold = (closes.iloc[-1] / closes.iloc[0] - 1) * 100
+            print(f"\n{symbol} — buy & hold: {hold:+.1f}%")
+            header = f"  {'variant':<22}{'trades':>7}{'win %':>8}{'return':>9}"
+            print(header)
+            print("  " + "-" * (len(header) - 2))
+            for name, buy, sell, ma, vol in variants:
+                trades, win_rate, total = self.simulate(df, buy, sell, ma, vol)
+                print(f"  {name:<22}{trades:>7}{win_rate:>7.1f}%{total:>+8.1f}%")
         print("\nNote: backtest ignores slippage, commissions, and fills at next-bar close.\n")
 
 
@@ -286,6 +399,7 @@ def main() -> None:
             "Add them to rsi-midline-bot/.env (see .env.example) or export them "
             "in your shell."
         )
+    apply_profile(os.environ.get("TIMEFRAME", "15Min"))
     cfg = Config()
     bot = RsiMidlineBot(cfg)
     if not cfg.paper and mode != "backtest":

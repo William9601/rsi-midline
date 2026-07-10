@@ -32,6 +32,30 @@ python rsi_midline_bot.py run       # evaluate signals once and place orders
 python rsi_midline_bot.py loop      # keep running, checking every POLL_SECONDS
 ```
 
+## Per-timeframe profiles
+
+`profiles.json` records the tuned settings for each timeframe **and the
+backtest evidence behind them**. On startup the bot applies the profile
+matching your `TIMEFRAME`, so switching timeframes automatically switches the
+band levels, volume filter, and trend filter to what tested best there.
+
+Precedence: anything set explicitly in `.env` or the shell **overrides** the
+profile — profiles only fill in settings you haven't chosen yourself. The
+startup log shows exactly which values came from the profile.
+
+Current findings (tuned 2026-07-10 on SPY/AAPL/MSFT):
+
+- **1Day** — plain RSI-50 cross, all filters off. Filters (band, MA200,
+  volume) all *reduced* returns on daily bars; the volume filter especially
+  is far too strict there.
+- **15Min** — band 55/45 + volume ×1.5 + MA200. Volume confirmation was the
+  single biggest intraday improvement.
+- **1Hour / 5Min / 1Min** — marked `not backtested` in the file; guesses
+  inherited from the 15Min findings. Run `backtest` on them before trusting.
+
+When you re-tune, update `settings`, `tuned`, and `notes` in `profiles.json`
+so the evidence stays with the numbers.
+
 ## Configuration
 
 Everything is set via environment variables (see `.env.example`):
@@ -42,6 +66,11 @@ Everything is set via environment variables (see `.env.example`):
 | `TIMEFRAME` | `15Min` | Bar size: `1Min`, `5Min`, `15Min`, `1Hour`, `1Day` |
 | `RSI_PERIOD` | `14` | RSI lookback period |
 | `MIDLINE` | `50` | Crossover threshold |
+| `RSI_BUY_LEVEL` | `MIDLINE` | Band variant: buy when RSI crosses above this |
+| `RSI_SELL_LEVEL` | `MIDLINE` | Band variant: sell when RSI crosses below this |
+| `TREND_MA_PERIOD` | `0` (off) | Only buy when price is above this MA (in bars) |
+| `VOLUME_MULT` | `0` (off) | Only buy when signal-bar volume ≥ this × recent average |
+| `VOLUME_LOOKBACK` | `20` | Bars used for the average-volume baseline |
 | `NOTIONAL` | `1000` | Dollars per new position |
 | `POLL_SECONDS` | `60` | Loop-mode check interval |
 | `BACKTEST_DAYS` | `365` | History window for backtests |
@@ -61,7 +90,7 @@ Everything is set via environment variables (see `.env.example`):
 - This is a starting point, not financial advice. Backtest results ignore
   slippage and assume next-bar-close fills; live results will differ.
 - The RSI-50 cross is a trend-following filter — it whipsaws in sideways
-  markets. Common refinements: require RSI > 50 *and* price above a moving
-  average, add a stop-loss, or use a band (e.g. buy above 55, sell below 45)
-  to cut whipsaws.
+  markets, especially on intraday timeframes. Use `backtest` mode to compare
+  the plain cross against the band (`RSI_BUY_LEVEL`/`RSI_SELL_LEVEL`) and
+  trend-filter (`TREND_MA_PERIOD`) variants before picking settings.
 - Keep `ALPACA_PAPER=true` until you've watched it run for a while.

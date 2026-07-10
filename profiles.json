@@ -1,0 +1,71 @@
+{
+  "_readme": "Tuned per-timeframe defaults, applied automatically based on TIMEFRAME. Anything set explicitly in .env or the shell overrides these. When you re-tune, update 'settings', 'tuned', and 'notes' so the evidence stays with the numbers.",
+
+  "1Day": {
+    "tuned": "2026-07-10",
+    "status": "backtested",
+    "notes": "3y backtest (2023-07 to 2026-07, SPY/AAPL/MSFT): plain RSI-50 cross was best (+48%/+46%/+23%). Band 55/45 and MA200 both reduced returns in this period. Volume filter far too strict on daily bars (2-6 trades in 3y, killed returns) - daily crosses rarely land on 1.5x volume days. Loop mode evaluates once per day, 10 min before close, so POLL_SECONDS barely matters.",
+    "settings": {
+      "RSI_BUY_LEVEL": "50",
+      "RSI_SELL_LEVEL": "50",
+      "TREND_MA_PERIOD": "0",
+      "VOLUME_MULT": "0"
+    }
+  },
+
+  "1Hour": {
+    "tuned": "2026-07-10",
+    "status": "not backtested - inherited from 15Min findings",
+    "notes": "Untested guess: intraday chop should make band + volume + trend filters help here as they did on 15Min. Run 'backtest' with TIMEFRAME=1Hour before trusting. MA200 = 200 hourly bars (~6 weeks).",
+    "settings": {
+      "RSI_BUY_LEVEL": "55",
+      "RSI_SELL_LEVEL": "45",
+      "TREND_MA_PERIOD": "200",
+      "VOLUME_MULT": "1.5",
+      "VOLUME_LOOKBACK": "20",
+      "POLL_SECONDS": "1800"
+    }
+  },
+
+  "15Min": {
+    "tuned": "2026-07-10",
+    "status": "backtested",
+    "notes": "1y backtest (2025-07 to 2026-07, SPY/AAPL/MSFT): raw 50-cross churns ~800-950 trades/yr and loses badly. Band 55/45 + volume 1.5x + MA200 was best on every symbol (SPY +15.9% with 44% win rate, MSFT -0.8% vs -23% hold; AAPL improved but still negative). Volume confirmation is the single biggest intraday improvement. Still trails daily-bar buy&hold overall.",
+    "settings": {
+      "RSI_BUY_LEVEL": "55",
+      "RSI_SELL_LEVEL": "45",
+      "TREND_MA_PERIOD": "200",
+      "VOLUME_MULT": "1.5",
+      "VOLUME_LOOKBACK": "20",
+      "POLL_SECONDS": "450"
+    }
+  },
+
+  "5Min": {
+    "tuned": "2026-07-10",
+    "status": "not backtested - inherited from 15Min findings",
+    "notes": "Untested guess: even choppier than 15Min, so filters matter more; expect worse results overall. Run 'backtest' with TIMEFRAME=5Min before trusting.",
+    "settings": {
+      "RSI_BUY_LEVEL": "55",
+      "RSI_SELL_LEVEL": "45",
+      "TREND_MA_PERIOD": "200",
+      "VOLUME_MULT": "1.5",
+      "VOLUME_LOOKBACK": "20",
+      "POLL_SECONDS": "150"
+    }
+  },
+
+  "1Min": {
+    "tuned": "2026-07-10",
+    "status": "not recommended",
+    "notes": "Not backtested and not recommended: at 1-minute bars, spread and slippage dominate any RSI edge. Kept only so the profile lookup never falls through silently.",
+    "settings": {
+      "RSI_BUY_LEVEL": "55",
+      "RSI_SELL_LEVEL": "45",
+      "TREND_MA_PERIOD": "200",
+      "VOLUME_MULT": "2.0",
+      "VOLUME_LOOKBACK": "20",
+      "POLL_SECONDS": "60"
+    }
+  }
+}
