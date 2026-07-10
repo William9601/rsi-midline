@@ -11,6 +11,10 @@ Usage:
     python rsi_midline_bot.py run        # evaluate signals once and trade
     python rsi_midline_bot.py loop       # run continuously on an interval
     python rsi_midline_bot.py backtest   # backtest the strategy on history
+    python rsi_midline_bot.py tune       # grid-search + walk-forward validate,
+                                         # updating profiles.json if the winner
+                                         # holds up out-of-sample (--dry-run to
+                                         # only report)
 """
 
 from __future__ import annotations
@@ -318,11 +322,15 @@ class RsiMidlineBot:
         sell_level: float,
         ma_period: int,
         vol_mult: float = 0,
+        eval_from: int = 0,
+        eval_to: int | None = None,
     ) -> tuple[int, float, float]:
         """Simulate one variant; returns (trades, win rate %, total return %).
 
         In the market from the bar after RSI crosses above buy_level until the
         bar after it crosses below sell_level (signals act on the next bar).
+        eval_from/eval_to restrict *scoring* to a bar range while indicators
+        still warm up on the full history (used for walk-forward splits).
         """
         closes = df["close"]
         r = rsi(closes, self.cfg.rsi_period)
@@ -338,6 +346,9 @@ class RsiMidlineBot:
         state[cross_down] = 0.0
         in_market = state.ffill().fillna(0).shift(1, fill_value=0).astype(bool)
         bar_returns = closes.pct_change().fillna(0)
+        if eval_from or eval_to is not None:
+            in_market = in_market.iloc[eval_from:eval_to]
+            bar_returns = bar_returns.iloc[eval_from:eval_to]
         total = ((1 + bar_returns * in_market).prod() - 1) * 100
         # Group consecutive in-market bars into trades for the win rate.
         grp = (in_market != in_market.shift()).cumsum()
@@ -384,12 +395,155 @@ class RsiMidlineBot:
                 print(f"  {name:<22}{trades:>7}{win_rate:>7.1f}%{total:>+8.1f}%")
         print("\nNote: backtest ignores slippage, commissions, and fills at next-bar close.\n")
 
+    # -- tuning ---------------------------------------------------------------
+
+    GRID_BANDS = [(50, 50), (55, 45), (60, 40)]
+    GRID_MAS = [0, 50, 200]
+    GRID_VOLS = [0, 1.5, 2.0]
+
+    def tune(self, write: bool = True) -> None:
+        """Grid-search parameters with walk-forward validation.
+
+        Optimizes on the first TRAIN_SPLIT of history, validates the winner on
+        the held-out remainder, and only updates profiles.json if the winner
+        also beats the current profile on the out-of-sample window.
+        """
+        cfg = self.cfg
+        split_frac = float(os.environ.get("TRAIN_SPLIT", "0.7"))
+        log.info("Fetching %d days of %s bars for %s — this can take a minute...",
+                 cfg.backtest_days, cfg.timeframe, ",".join(cfg.symbols))
+        bars = self.fetch_bars(cfg.symbols, days=cfg.backtest_days)
+        dfs: dict[str, pd.DataFrame] = {}
+        for symbol in cfg.symbols:
+            symbol = symbol.strip().upper()
+            try:
+                dfs[symbol] = bars.xs(symbol, level="symbol")
+            except KeyError:
+                log.warning("%s: no data, excluded from tuning", symbol)
+        if not dfs:
+            sys.exit("No data for any symbol")
+        splits = {s: int(len(df) * split_frac) for s, df in dfs.items()}
+
+        def avg_scores(buy: float, sell: float, ma: int, vol: float) -> dict:
+            train, test, train_trades, test_trades = [], [], 0, 0
+            for sym, df in dfs.items():
+                sp = splits[sym]
+                n_tr, _, r_tr = self.simulate(df, buy, sell, ma, vol, eval_to=sp)
+                n_te, _, r_te = self.simulate(df, buy, sell, ma, vol, eval_from=sp)
+                train.append(r_tr); test.append(r_te)
+                train_trades += n_tr; test_trades += n_te
+            return {"buy": buy, "sell": sell, "ma": ma, "vol": vol,
+                    "train": sum(train) / len(train), "test": sum(test) / len(test),
+                    "train_trades": train_trades, "test_trades": test_trades}
+
+        results = [avg_scores(buy, sell, ma, vol)
+                   for buy, sell in self.GRID_BANDS
+                   for ma in self.GRID_MAS
+                   for vol in self.GRID_VOLS]
+        # A combo that barely ever trades can "win" by doing nothing; require
+        # some in-sample activity before considering it.
+        active = [r for r in results if r["train_trades"] >= 2 * len(dfs)] or results
+        # Winner is chosen on the training window ONLY (no peeking at test).
+        active.sort(key=lambda r: r["train"], reverse=True)
+        winner = active[0]
+
+        hold_test = sum(
+            (df["close"].iloc[-1] / df["close"].iloc[splits[s]] - 1) * 100
+            for s, df in dfs.items()
+        ) / len(dfs)
+
+        print(f"\nTune: {cfg.timeframe}, {cfg.backtest_days} days, "
+              f"{len(results)} combos, train {split_frac:.0%} / test {1 - split_frac:.0%} "
+              f"(returns averaged across {', '.join(dfs)})\n")
+        header = (f"  {'buy/sell':<10}{'MA':>5}{'vol':>6}"
+                  f"{'train %':>10}{'test %':>9}{'test trades':>13}")
+        print("  top 5 by TRAIN return — test column is out-of-sample:")
+        print(header)
+        print("  " + "-" * (len(header) - 2))
+        for r in active[:5]:
+            print(f"  {r['buy']:g}/{r['sell']:<7g}{r['ma']:>5}{r['vol']:>6g}"
+                  f"{r['train']:>+9.1f}%{r['test']:>+8.1f}%{r['test_trades']:>13}")
+        print(f"\n  buy & hold on test window: {hold_test:+.1f}%")
+
+        # Gate: current profile settings evaluated on the same test window.
+        current = self._current_profile_combo()
+        cur = avg_scores(*current)
+        print(f"  current profile ({current[0]:g}/{current[1]:g}, MA {current[2]}, "
+              f"vol x{current[3]:g}) on test window: {cur['test']:+.1f}%")
+
+        if winner["test"] < winner["train"] / 3:
+            print("\n  WARNING: winner's out-of-sample return is far below its "
+                  "training return — likely overfit to the training window.")
+        if (winner["buy"], winner["sell"], winner["ma"], winner["vol"]) == current:
+            print("\nVerdict: current profile is already the winner — nothing to update.\n")
+            return
+        if winner["test"] <= cur["test"]:
+            print("\nVerdict: winner does NOT beat the current profile out-of-sample "
+                  f"({winner['test']:+.1f}% vs {cur['test']:+.1f}%) — keeping profiles.json as is.\n")
+            return
+        print(f"\nVerdict: winner beats current profile out-of-sample "
+              f"({winner['test']:+.1f}% vs {cur['test']:+.1f}%).")
+        if write:
+            self._write_profile(winner, hold_test, split_frac, list(dfs))
+            print(f"Updated profiles.json [{cfg.timeframe}].\n")
+        else:
+            print("Dry run — profiles.json not modified.\n")
+
+    def _profiles_path(self) -> str:
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), "profiles.json")
+
+    def _current_profile_combo(self) -> tuple[float, float, int, float]:
+        """Current profile's (buy, sell, ma, vol), falling back to plain midline."""
+        try:
+            with open(self._profiles_path()) as f:
+                s = json.load(f)[self.cfg.timeframe]["settings"]
+            return (float(s.get("RSI_BUY_LEVEL", self.cfg.midline)),
+                    float(s.get("RSI_SELL_LEVEL", self.cfg.midline)),
+                    int(s.get("TREND_MA_PERIOD", 0)),
+                    float(s.get("VOLUME_MULT", 0)))
+        except (OSError, KeyError, ValueError):
+            return (self.cfg.midline, self.cfg.midline, 0, 0)
+
+    def _write_profile(self, winner: dict, hold_test: float,
+                       split_frac: float, symbols: list[str]) -> None:
+        path = self._profiles_path()
+        data = {}
+        if os.path.exists(path):
+            with open(path) as f:
+                data = json.load(f)
+        old = data.get(self.cfg.timeframe, {}).get("settings", {})
+        settings = {
+            "RSI_BUY_LEVEL": f"{winner['buy']:g}",
+            "RSI_SELL_LEVEL": f"{winner['sell']:g}",
+            "TREND_MA_PERIOD": str(winner["ma"]),
+            "VOLUME_MULT": f"{winner['vol']:g}",
+            "VOLUME_LOOKBACK": str(self.cfg.vol_lookback),
+        }
+        if "POLL_SECONDS" in old:  # tune doesn't search this; keep the old value
+            settings["POLL_SECONDS"] = old["POLL_SECONDS"]
+        data[self.cfg.timeframe] = {
+            "tuned": datetime.now().strftime("%Y-%m-%d"),
+            "status": "backtested (walk-forward)",
+            "notes": (
+                f"Auto-tuned on {','.join(symbols)} over {self.cfg.backtest_days}d of "
+                f"{self.cfg.timeframe} bars, {split_frac:.0%}/{1 - split_frac:.0%} "
+                f"walk-forward split. Train avg {winner['train']:+.1f}%, "
+                f"out-of-sample test avg {winner['test']:+.1f}% vs buy&hold "
+                f"{hold_test:+.1f}% on the test window ({winner['test_trades']} test trades). "
+                f"Grid: bands {self.GRID_BANDS}, MA {self.GRID_MAS}, vol {self.GRID_VOLS}."
+            ),
+            "settings": settings,
+        }
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2)
+            f.write("\n")
+
 
 # ---------------------------------------------------------------------------
 
 def main() -> None:
     mode = sys.argv[1] if len(sys.argv) > 1 else "run"
-    if mode not in ("run", "loop", "backtest"):
+    if mode not in ("run", "loop", "backtest", "tune"):
         print(__doc__)
         sys.exit(1)
     load_dotenv()
@@ -402,12 +556,14 @@ def main() -> None:
     apply_profile(os.environ.get("TIMEFRAME", "15Min"))
     cfg = Config()
     bot = RsiMidlineBot(cfg)
-    if not cfg.paper and mode != "backtest":
+    if not cfg.paper and mode in ("run", "loop"):
         log.warning("LIVE TRADING MODE — real money at risk")
     if mode == "run":
         bot.run_once()
     elif mode == "loop":
         bot.run_loop()
+    elif mode == "tune":
+        bot.tune(write="--dry-run" not in sys.argv[2:])
     else:
         bot.backtest()
 

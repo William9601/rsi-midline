@@ -1,5 +1,5 @@
 {
-  "_readme": "Tuned per-timeframe defaults, applied automatically based on TIMEFRAME. Anything set explicitly in .env or the shell overrides these. When you re-tune, update 'settings', 'tuned', and 'notes' so the evidence stays with the numbers.",
+  "_readme": "Tuned per-timeframe defaults, applied automatically based on TIMEFRAME. Anything set explicitly in .env or the shell overrides these. Run 'python rsi_midline_bot.py tune' to re-tune with walk-forward validation (it updates this file only if the winner holds up out-of-sample), or edit by hand and update 'tuned'/'notes' so the evidence stays with the numbers.",
 
   "1Day": {
     "tuned": "2026-07-10",

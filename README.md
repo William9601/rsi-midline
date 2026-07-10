@@ -30,7 +30,24 @@ you explicitly set `ALPACA_PAPER=false`.
 python rsi_midline_bot.py backtest   # sanity-check the strategy on history first
 python rsi_midline_bot.py run       # evaluate signals once and place orders
 python rsi_midline_bot.py loop      # keep running, checking every POLL_SECONDS
+python rsi_midline_bot.py tune      # grid-search + walk-forward validation
 ```
+
+### Tune mode
+
+`tune` grid-searches band levels × trend MA × volume filter (27 combos) for
+the current `TIMEFRAME`, with honest walk-forward validation:
+
+1. The winner is picked on the **first 70%** of history only (train).
+2. It's then evaluated on the held-out **last 30%** (test) it never saw.
+3. `profiles.json` is only updated if the winner also beats the *current*
+   profile on that out-of-sample window — otherwise the run reports why and
+   changes nothing. Use `--dry-run` to never write.
+
+A combo that shines in train but collapses in test is overfit; the gate
+exists to keep those out of your profiles. Set `TRAIN_SPLIT` (default `0.7`)
+to change the split, and `BACKTEST_DAYS` to widen the history (use 1000+ for
+`1Day`).
 
 ## Per-timeframe profiles
 
