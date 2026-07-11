@@ -1,6 +1,9 @@
 # Secrets — never commit API keys
 .env
 
+# Trade journal — account data, not code
+trades.db
+
 # Virtual environment
 .venv/
 

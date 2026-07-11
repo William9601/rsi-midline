@@ -31,7 +31,19 @@ python rsi_midline_bot.py backtest   # sanity-check the strategy on history firs
 python rsi_midline_bot.py run       # evaluate signals once and place orders
 python rsi_midline_bot.py loop      # keep running, checking every POLL_SECONDS
 python rsi_midline_bot.py tune      # grid-search + walk-forward validation
+python rsi_midline_bot.py trades    # show the trade journal (add a number for more rows)
 ```
+
+### Trade journal
+
+Every order is recorded in `trades.db` (SQLite, gitignored) with the full
+context that triggered it: price, RSI, relative volume, timeframe, the active
+band/filter settings, and whether it was a paper trade. This is what lets you
+later compare live behavior against what the backtests promised — e.g. join
+trades into round trips and check the realized win rate per settings profile.
+Query it directly with `sqlite3 trades.db "SELECT * FROM trades"` or via
+`python rsi_midline_bot.py trades 50` for the last 50 entries. Set `TRADES_DB`
+to change the location.
 
 ### Tune mode
 

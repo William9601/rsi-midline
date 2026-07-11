@@ -15,6 +15,7 @@ Usage:
                                          # updating profiles.json if the winner
                                          # holds up out-of-sample (--dry-run to
                                          # only report)
+    python rsi_midline_bot.py trades     # show the trade journal (SQLite)
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sqlite3
 import sys
 import time
 import warnings
@@ -173,6 +175,53 @@ def crossover_signal(
 
 
 # ---------------------------------------------------------------------------
+# Trade journal
+# ---------------------------------------------------------------------------
+
+class TradeLog:
+    """SQLite journal of every order, with the signal context that caused it."""
+
+    COLUMNS = ("ts", "symbol", "side", "price", "notional", "qty", "order_id",
+               "rsi", "rvol", "timeframe", "rsi_buy", "rsi_sell", "trend_ma",
+               "vol_mult", "paper")
+
+    def __init__(self, path: str):
+        self.conn = sqlite3.connect(path)
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,          -- UTC ISO timestamp
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,        -- buy / sell
+                price REAL,                -- last close when the signal fired
+                notional REAL,             -- dollars submitted (buys)
+                qty REAL,                  -- shares closed (sells)
+                order_id TEXT,
+                rsi REAL,                  -- RSI on the signal bar
+                rvol REAL,                 -- signal-bar volume / recent average
+                timeframe TEXT,
+                rsi_buy REAL, rsi_sell REAL, trend_ma INTEGER, vol_mult REAL,
+                paper INTEGER
+            )""")
+        self.conn.commit()
+
+    def record(self, **f) -> None:
+        f["ts"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        self.conn.execute(
+            f"INSERT INTO trades ({','.join(self.COLUMNS)}) "
+            f"VALUES ({','.join('?' * len(self.COLUMNS))})",
+            tuple(f.get(c) for c in self.COLUMNS),
+        )
+        self.conn.commit()
+
+    def recent(self, limit: int = 20) -> list[tuple]:
+        return self.conn.execute(
+            f"SELECT {','.join(self.COLUMNS)} FROM trades "
+            "ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()[::-1]
+
+
+# ---------------------------------------------------------------------------
 # Bot
 # ---------------------------------------------------------------------------
 
@@ -184,6 +233,9 @@ class RsiMidlineBot:
         if cfg.timeframe not in TIMEFRAMES:
             raise ValueError(f"TIMEFRAME must be one of {list(TIMEFRAMES)}")
         self.timeframe = TIMEFRAMES[cfg.timeframe]
+        db_path = os.environ.get("TRADES_DB") or os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "trades.db")
+        self.journal = TradeLog(db_path)
 
     # -- data ---------------------------------------------------------------
 
@@ -220,7 +272,16 @@ class RsiMidlineBot:
                 return float(pos.qty)
         return 0.0
 
-    def enter(self, symbol: str) -> None:
+    def _log_trade(self, symbol: str, side: str, ctx: dict, **extra) -> None:
+        self.journal.record(
+            symbol=symbol, side=side, price=ctx.get("price"),
+            rsi=ctx.get("rsi"), rvol=ctx.get("rvol"),
+            timeframe=self.cfg.timeframe, rsi_buy=self.cfg.rsi_buy,
+            rsi_sell=self.cfg.rsi_sell, trend_ma=self.cfg.trend_ma,
+            vol_mult=self.cfg.vol_mult, paper=int(self.cfg.paper), **extra,
+        )
+
+    def enter(self, symbol: str, ctx: dict) -> None:
         if self.position_qty(symbol) > 0:
             log.info("%s: buy signal but already long, skipping", symbol)
             return
@@ -232,14 +293,18 @@ class RsiMidlineBot:
                 time_in_force=TimeInForce.DAY,
             )
         )
+        self._log_trade(symbol, "buy", ctx,
+                        notional=self.cfg.notional, order_id=str(order.id))
         log.info("%s: BUY $%.2f submitted (order %s)", symbol, self.cfg.notional, order.id)
 
-    def exit(self, symbol: str) -> None:
-        if self.position_qty(symbol) <= 0:
+    def exit(self, symbol: str, ctx: dict) -> None:
+        qty = self.position_qty(symbol)
+        if qty <= 0:
             log.info("%s: sell signal but no position, skipping", symbol)
             return
-        self.trading.close_position(symbol)
-        log.info("%s: SELL — position closed", symbol)
+        order = self.trading.close_position(symbol)
+        self._log_trade(symbol, "sell", ctx, qty=qty, order_id=str(order.id))
+        log.info("%s: SELL — position closed (%.4f shares)", symbol, qty)
 
     # -- main passes ----------------------------------------------------------
 
@@ -262,14 +327,16 @@ class RsiMidlineBot:
                 continue
             closes = df["close"]
             r = rsi(closes, self.cfg.rsi_period)
+            # Volume on the latest bar vs the average of the bars before it,
+            # computed regardless of the filter so it lands in the journal.
+            avg_vol = df["volume"].shift(1).rolling(self.cfg.vol_lookback).mean().iloc[-1]
+            rvol = float(df["volume"].iloc[-1] / avg_vol) \
+                if avg_vol and not pd.isna(avg_vol) else None
             signal = crossover_signal(r, self.cfg.rsi_buy, self.cfg.rsi_sell)
             if signal == "buy" and self.cfg.vol_mult:
-                # Volume on the signal bar vs the average of the bars before it.
-                avg_vol = df["volume"].shift(1).rolling(self.cfg.vol_lookback).mean().iloc[-1]
-                rvol = df["volume"].iloc[-1] / avg_vol if avg_vol else float("nan")
-                if not rvol >= self.cfg.vol_mult:
-                    log.info("%s: buy signal vetoed by volume filter (rvol %.2f < %.2f)",
-                             symbol, rvol, self.cfg.vol_mult)
+                if rvol is None or rvol < self.cfg.vol_mult:
+                    log.info("%s: buy signal vetoed by volume filter (rvol %s < %.2f)",
+                             symbol, f"{rvol:.2f}" if rvol else "n/a", self.cfg.vol_mult)
                     signal = None
             if signal == "buy" and self.cfg.trend_ma:
                 ma = closes.rolling(self.cfg.trend_ma).mean().iloc[-1]
@@ -278,10 +345,11 @@ class RsiMidlineBot:
                              symbol, closes.iloc[-1], self.cfg.trend_ma, ma)
                     signal = None
             log.info("%s: RSI=%.1f signal=%s", symbol, r.iloc[-1], signal or "none")
+            ctx = {"price": float(closes.iloc[-1]), "rsi": float(r.iloc[-1]), "rvol": rvol}
             if signal == "buy":
-                self.enter(symbol)
+                self.enter(symbol, ctx)
             elif signal == "sell":
-                self.exit(symbol)
+                self.exit(symbol, ctx)
 
     def seconds_until_daily_eval(self) -> float:
         """Time until the daily-bar evaluation window (10 min before close)."""
@@ -489,6 +557,24 @@ class RsiMidlineBot:
         else:
             print("Dry run — profiles.json not modified.\n")
 
+    def show_trades(self, limit: int = 20) -> None:
+        rows = self.journal.recent(limit)
+        if not rows:
+            print("No trades logged yet.")
+            return
+        header = (f"{'time (UTC)':<21}{'symbol':<7}{'side':<6}{'price':>9}"
+                  f"{'amount':>12}{'RSI':>6}{'rvol':>6}{'tf':>7}{'paper':>7}")
+        print(header)
+        print("-" * len(header))
+        for row in rows:
+            r = dict(zip(TradeLog.COLUMNS, row))
+            amount = f"${r['notional']:,.0f}" if r["side"] == "buy" \
+                else f"{r['qty']:.4f} sh"
+            print(f"{r['ts'][:19]:<21}{r['symbol']:<7}{r['side'].upper():<6}"
+                  f"{r['price']:>9.2f}{amount:>12}{r['rsi']:>6.1f}"
+                  f"{format(r['rvol'], '.2f') if r['rvol'] is not None else 'n/a':>6}"
+                  f"{r['timeframe']:>7}{'yes' if r['paper'] else 'NO':>7}")
+
     def _profiles_path(self) -> str:
         return os.path.join(os.path.dirname(os.path.abspath(__file__)), "profiles.json")
 
@@ -543,7 +629,7 @@ class RsiMidlineBot:
 
 def main() -> None:
     mode = sys.argv[1] if len(sys.argv) > 1 else "run"
-    if mode not in ("run", "loop", "backtest", "tune"):
+    if mode not in ("run", "loop", "backtest", "tune", "trades"):
         print(__doc__)
         sys.exit(1)
     load_dotenv()
@@ -564,6 +650,9 @@ def main() -> None:
         bot.run_loop()
     elif mode == "tune":
         bot.tune(write="--dry-run" not in sys.argv[2:])
+    elif mode == "trades":
+        limit = int(sys.argv[2]) if len(sys.argv) > 2 else 20
+        bot.show_trades(limit)
     else:
         bot.backtest()
 
