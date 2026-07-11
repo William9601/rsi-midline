@@ -28,6 +28,9 @@ is config (`profiles.json`, `.env`) or generated data (`trades.db`).
   tested standalone with synthetic pandas Series — they don't need API keys.
 - Override any setting per-invocation via env: `TIMEFRAME=15Min BACKTEST_DAYS=1095 .venv/bin/python rsi_midline_bot.py backtest`.
 - Fetching a year of 15Min bars takes ~1 min of silence; daily is seconds. Use generous timeouts.
+- Unattended cloud deployment (systemd, one service per bot instance): see
+  `deploy/README.md`. Per-instance settings live in `deploy/env/*.env`
+  (gitignored; `.example` files are committed).
 
 ## Critical safety notes
 

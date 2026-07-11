@@ -1,5 +1,6 @@
 # Secrets — never commit API keys
 .env
+deploy/env/*.env
 
 # Trade journal — account data, not code
 trades.db

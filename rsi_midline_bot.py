@@ -20,6 +20,7 @@ Usage:
 
 from __future__ import annotations
 
+import csv
 import json
 import logging
 import os
@@ -107,6 +108,9 @@ TIMEFRAMES = {
     "1Day": TimeFrame(1, TimeFrameUnit.Day),
 }
 
+# Higher timeframes the HTF trend filter can resample the trading bars into.
+HTF_RULES = {"1Hour": "1h", "4Hour": "4h", "1Day": "1D"}
+
 
 @dataclass
 class Config:
@@ -133,6 +137,10 @@ class Config:
     # multiple of the recent average (0 = off).
     vol_mult: float = field(default_factory=lambda: float(os.environ.get("VOLUME_MULT", "0")))
     vol_lookback: int = field(default_factory=lambda: int(os.environ.get("VOLUME_LOOKBACK", "20")))
+    # Higher-timeframe trend confirmation: only buy when the close is above
+    # this MA on HTF_TIMEFRAME bars resampled from the trading bars (0 = off).
+    htf_ma: int = field(default_factory=lambda: int(os.environ.get("HTF_MA_PERIOD", "0")))
+    htf_timeframe: str = field(default_factory=lambda: os.environ.get("HTF_TIMEFRAME", "1Hour"))
     # Trailing stop: place a server-side GTC trailing stop this % below the
     # high-water mark after each entry (0 = off). Whole-share sizing applies.
     trail_percent: float = field(default_factory=lambda: float(os.environ.get("TRAIL_PERCENT", "0")))
@@ -179,6 +187,24 @@ def crossover_signal(
     return None
 
 
+def htf_trend_ok(df: pd.DataFrame, rule: str, ma_period: int,
+                 bar_len: timedelta) -> pd.Series:
+    """True where the higher-timeframe trend is up (HTF close above its MA).
+
+    Resamples the trading-timeframe bars up to the higher timeframe, then
+    aligns back so each trading bar only sees HTF bars that had fully closed
+    by the time the trading bar itself closed — no look-ahead. NaN warmup
+    (fewer than ma_period HTF bars) counts as trend-down, like the trend MA.
+    """
+    htf_close = df["close"].resample(rule, label="right", closed="left").last().dropna()
+    ok = htf_close > htf_close.rolling(ma_period).mean()
+    # A bar indexed at t closes at t + bar_len; HTF bars are indexed at their
+    # end time, so ffill picks the latest HTF bar that ended by then. Bars
+    # before the first HTF close reindex to NaN, which != 1.0 -> False.
+    aligned = ok.astype(float).reindex(df.index + bar_len, method="ffill")
+    return pd.Series(aligned.to_numpy() == 1.0, index=df.index)
+
+
 # ---------------------------------------------------------------------------
 # Trade journal
 # ---------------------------------------------------------------------------
@@ -188,7 +214,7 @@ class TradeLog:
 
     COLUMNS = ("ts", "symbol", "side", "price", "notional", "qty", "order_id",
                "rsi", "rvol", "timeframe", "rsi_buy", "rsi_sell", "trend_ma",
-               "vol_mult", "paper")
+               "vol_mult", "htf_ma", "paper")
 
     def __init__(self, path: str):
         self.conn = sqlite3.connect(path)
@@ -206,8 +232,13 @@ class TradeLog:
                 rvol REAL,                 -- signal-bar volume / recent average
                 timeframe TEXT,
                 rsi_buy REAL, rsi_sell REAL, trend_ma INTEGER, vol_mult REAL,
+                htf_ma INTEGER,            -- higher-timeframe trend MA (0 = off)
                 paper INTEGER
             )""")
+        try:  # migrate journals created before the HTF filter existed
+            self.conn.execute("ALTER TABLE trades ADD COLUMN htf_ma INTEGER")
+        except sqlite3.OperationalError:
+            pass
         self.conn.commit()
 
     def record(self, **f) -> None:
@@ -242,6 +273,8 @@ class RsiMidlineBot:
         self.data = StockHistoricalDataClient(cfg.api_key, cfg.secret_key)
         if cfg.timeframe not in TIMEFRAMES:
             raise ValueError(f"TIMEFRAME must be one of {list(TIMEFRAMES)}")
+        if cfg.htf_ma and cfg.htf_timeframe not in HTF_RULES:
+            raise ValueError(f"HTF_TIMEFRAME must be one of {list(HTF_RULES)}")
         self.timeframe = TIMEFRAMES[cfg.timeframe]
         db_path = os.environ.get("TRADES_DB") or os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "trades.db")
@@ -257,6 +290,14 @@ class RsiMidlineBot:
         )
         return self.data.get_stock_bars(req).df
 
+    def bar_len(self) -> timedelta:
+        """Duration of one bar of the trading timeframe."""
+        if self.timeframe.unit == TimeFrameUnit.Minute:
+            return timedelta(minutes=self.timeframe.amount_value)
+        if self.timeframe.unit == TimeFrameUnit.Hour:
+            return timedelta(hours=self.timeframe.amount_value)
+        return timedelta(days=self.timeframe.amount_value)
+
     def closed_bars(self, symbol: str, bars: pd.DataFrame) -> pd.DataFrame | None:
         """Bars for one symbol, dropping the still-forming last bar."""
         try:
@@ -266,11 +307,8 @@ class RsiMidlineBot:
         # For intraday timeframes the most recent bar may still be forming;
         # drop it so signals only fire on completed bars.
         if self.timeframe.unit != TimeFrameUnit.Day:
-            bar_len = timedelta(minutes=self.timeframe.amount_value) \
-                if self.timeframe.unit == TimeFrameUnit.Minute \
-                else timedelta(hours=self.timeframe.amount_value)
             last_start = df.index[-1]
-            if datetime.now(timezone.utc) < last_start + bar_len:
+            if datetime.now(timezone.utc) < last_start + self.bar_len():
                 df = df.iloc[:-1]
         return df
 
@@ -288,7 +326,8 @@ class RsiMidlineBot:
             rsi=ctx.get("rsi"), rvol=ctx.get("rvol"),
             timeframe=self.cfg.timeframe, rsi_buy=self.cfg.rsi_buy,
             rsi_sell=self.cfg.rsi_sell, trend_ma=self.cfg.trend_ma,
-            vol_mult=self.cfg.vol_mult, paper=int(self.cfg.paper), **extra,
+            vol_mult=self.cfg.vol_mult, htf_ma=self.cfg.htf_ma,
+            paper=int(self.cfg.paper), **extra,
         )
 
     def enter(self, symbol: str, ctx: dict) -> None:
@@ -419,6 +458,14 @@ class RsiMidlineBot:
                     log.info("%s: buy signal vetoed by trend filter (price %.2f <= MA%d %.2f)",
                              symbol, closes.iloc[-1], self.cfg.trend_ma, ma)
                     signal = None
+            if signal == "buy" and self.cfg.htf_ma:
+                htf_up = htf_trend_ok(df, HTF_RULES[self.cfg.htf_timeframe],
+                                      self.cfg.htf_ma, self.bar_len()).iloc[-1]
+                if not htf_up:
+                    log.info("%s: buy signal vetoed by HTF trend filter "
+                             "(%s close below MA%d)", symbol,
+                             self.cfg.htf_timeframe, self.cfg.htf_ma)
+                    signal = None
             log.info("%s: RSI=%.1f signal=%s", symbol, r.iloc[-1], signal or "none")
             ctx = {"price": float(closes.iloc[-1]), "rsi": float(r.iloc[-1]), "rvol": rvol}
             if signal == "buy":
@@ -466,6 +513,7 @@ class RsiMidlineBot:
         ma_period: int,
         vol_mult: float = 0,
         trail_pct: float = 0,
+        htf_ma: int = 0,
         eval_from: int = 0,
         eval_to: int | None = None,
     ) -> tuple[int, float, float]:
@@ -486,6 +534,9 @@ class RsiMidlineBot:
         if vol_mult:
             avg_vol = df["volume"].shift(1).rolling(self.cfg.vol_lookback).mean()
             cross_up &= df["volume"] >= avg_vol * vol_mult
+        if htf_ma:
+            cross_up &= htf_trend_ok(df, HTF_RULES[self.cfg.htf_timeframe],
+                                     htf_ma, self.bar_len())
         # The trailing stop is path-dependent (high-water mark), so walk the
         # bars to build the in-market series.
         c = closes.to_numpy()
@@ -524,19 +575,46 @@ class RsiMidlineBot:
         m = self.cfg.midline
         vm = self.cfg.vol_mult or 1.5
         tp = self.cfg.trail_percent or 8
+        # HTF trend confirmation only applies when resampling *up* from an
+        # intraday trading timeframe.
+        htf_ok = self.timeframe.unit != TimeFrameUnit.Day
         variants = [
-            (f"RSI {m:g} cross", m, m, 0, 0, 0),
-            ("Band 55/45", 55, 45, 0, 0, 0),
-            (f"RSI {m:g} + MA200", m, m, 200, 0, 0),
-            (f"RSI {m:g} + vol x{vm:g}", m, m, 0, vm, 0),
-            (f"Band + vol x{vm:g}", 55, 45, 0, vm, 0),
-            (f"Band + vol + MA200", 55, 45, 200, vm, 0),
-            (f"RSI {m:g} + trail {tp:g}%", m, m, 0, 0, tp),
-            (f"Band + trail {tp:g}%", 55, 45, 0, 0, tp),
+            # The resolved config (shell env > .env > profile > defaults), so
+            # any candidate profile can be A/B'd against the standard variants
+            # by overriding knobs per-invocation.
+            ("active settings", self.cfg.rsi_buy, self.cfg.rsi_sell,
+             self.cfg.trend_ma, self.cfg.vol_mult, self.cfg.trail_percent,
+             self.cfg.htf_ma if htf_ok else 0),
+            (f"RSI {m:g} cross", m, m, 0, 0, 0, 0),
+            ("Band 55/45", 55, 45, 0, 0, 0, 0),
+            (f"RSI {m:g} + MA200", m, m, 200, 0, 0, 0),
+            (f"RSI {m:g} + vol x{vm:g}", m, m, 0, vm, 0, 0),
+            (f"Band + vol x{vm:g}", 55, 45, 0, vm, 0, 0),
+            (f"Band + vol + MA200", 55, 45, 200, vm, 0, 0),
+            (f"RSI {m:g} + trail {tp:g}%", m, m, 0, 0, tp, 0),
+            (f"Band + trail {tp:g}%", 55, 45, 0, 0, tp, 0),
         ]
+        if htf_ok:
+            hm = self.cfg.htf_ma or 50
+            ht = HTF_RULES[self.cfg.htf_timeframe]
+            variants += [
+                (f"Band + {ht} MA{hm}", 55, 45, 0, 0, 0, hm),
+                (f"Band + MA200 + {ht} MA{hm}", 55, 45, 200, 0, 0, hm),
+                (f"Band+vol+MA200+{ht} MA{hm}", 55, 45, 200, vm, 0, hm),
+            ]
         print(f"\nBacktest: RSI({self.cfg.rsi_period}), timeframe={self.cfg.timeframe}, "
               f"last {self.cfg.backtest_days} days\n(MA200 = 200 bars of this timeframe; "
-              f"vol = signal-bar volume vs {self.cfg.vol_lookback}-bar average)")
+              f"vol = signal-bar volume vs {self.cfg.vol_lookback}-bar average"
+              + (f"; {ht} MA{hm} = close above MA{hm} on {self.cfg.htf_timeframe} "
+                 f"bars resampled from this timeframe)" if htf_ok else ")"))
+        print(f"'active settings' = resolved config (env > .env > profile): "
+              f"band {self.cfg.rsi_buy:g}/{self.cfg.rsi_sell:g}, "
+              f"MA {self.cfg.trend_ma}, vol x{self.cfg.vol_mult:g}, "
+              f"trail {self.cfg.trail_percent:g}%"
+              + (f", {self.cfg.htf_timeframe} MA{self.cfg.htf_ma}"
+                 if htf_ok and self.cfg.htf_ma else ""))
+        results = []
+        run_ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
         for symbol in self.cfg.symbols:
             symbol = symbol.strip().upper()
             try:
@@ -547,13 +625,40 @@ class RsiMidlineBot:
             closes = df["close"]
             hold = (closes.iloc[-1] / closes.iloc[0] - 1) * 100
             print(f"\n{symbol} — buy & hold: {hold:+.1f}%")
-            header = f"  {'variant':<22}{'trades':>7}{'win %':>8}{'return':>9}"
+            header = f"  {'variant':<26}{'trades':>7}{'win %':>8}{'return':>9}"
             print(header)
             print("  " + "-" * (len(header) - 2))
-            for name, buy, sell, ma, vol, trail in variants:
-                trades, win_rate, total = self.simulate(df, buy, sell, ma, vol, trail)
-                print(f"  {name:<22}{trades:>7}{win_rate:>7.1f}%{total:>+8.1f}%")
+            for name, buy, sell, ma, vol, trail, htf in variants:
+                trades, win_rate, total = self.simulate(df, buy, sell, ma, vol,
+                                                        trail, htf)
+                print(f"  {name:<26}{trades:>7}{win_rate:>7.1f}%{total:>+8.1f}%")
+                results.append({
+                    "run_ts": run_ts, "timeframe": self.cfg.timeframe,
+                    "days": self.cfg.backtest_days, "rsi_period": self.cfg.rsi_period,
+                    "symbol": symbol, "variant": name, "rsi_buy": buy,
+                    "rsi_sell": sell, "trend_ma": ma, "vol_mult": vol,
+                    "trail_pct": trail, "htf_ma": htf,
+                    "htf_timeframe": self.cfg.htf_timeframe if htf else "",
+                    "trades": trades, "win_rate": round(win_rate, 2),
+                    "return_pct": round(total, 2), "buyhold_pct": round(hold, 2),
+                })
+        self._log_backtest_results(results)
         print("\nNote: backtest ignores slippage, commissions, and fills at next-bar close.\n")
+
+    def _log_backtest_results(self, rows: list[dict]) -> None:
+        """Append every variant result to backtest_results.csv for comparison
+        across runs — the experiment log that survives the terminal scrollback."""
+        if not rows:
+            return
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "backtest_results.csv")
+        new_file = not os.path.exists(path)
+        with open(path, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(rows[0]))
+            if new_file:
+                writer.writeheader()
+            writer.writerows(rows)
+        print(f"\nLogged {len(rows)} variant results to backtest_results.csv")
 
     # -- tuning ---------------------------------------------------------------
 

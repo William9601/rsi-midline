@@ -1,11 +1,11 @@
 {
   "_readme": "Tuned per-timeframe defaults, applied automatically based on TIMEFRAME. Anything set explicitly in .env or the shell overrides these. Run 'python rsi_midline_bot.py tune' to re-tune with walk-forward validation (it updates this file only if the winner holds up out-of-sample), or edit by hand and update 'tuned'/'notes' so the evidence stays with the numbers.",
   "1Day": {
-    "tuned": "2026-07-10",
+    "tuned": "2026-07-11",
     "status": "backtested (walk-forward)",
-    "notes": "Auto-tuned on QQQ,GLD,IWM,SPY over 1095d of 1Day bars, 70%/30% walk-forward split. Train avg +36.7%, out-of-sample test avg +19.3% vs buy&hold +24.0% on the test window (11 test trades). Grid: bands [(50, 50), (55, 45), (60, 40)], MA [0, 50, 200], vol [0, 1.5, 2.0].",
+    "notes": "Hand-tuned on QQQ,GLD,IWM,SPY over 1095d of 1Day bars, 70%/30% walk-forward split, from a wider grid than tune's (asymmetric bands incl. 55/40, 65/45; MA 0/50/100/200; trail 0/8/12). 55/40 band: train avg +36.5%, out-of-sample test avg +20.7% vs prior 60/40 profile +19.3% and buy&hold +24.0% (13 test trades, all 4 symbols positive OOS). MA0 scored identically OOS; kept MA50 as downtrend-entry insurance. Full 1095d: QQQ +39.1%, GLD +118.7%, IWM +45.2%, SPY +60.2% (see backtest_results.csv 2026-07-11).",
     "settings": {
-      "RSI_BUY_LEVEL": "60",
+      "RSI_BUY_LEVEL": "55",
       "RSI_SELL_LEVEL": "40",
       "TREND_MA_PERIOD": "50",
       "VOLUME_MULT": "0",

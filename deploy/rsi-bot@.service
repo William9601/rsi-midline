@@ -1,0 +1,23 @@
+# systemd template unit: one bot instance per env file.
+#   systemctl enable --now rsi-bot@1day   -> loads deploy/env/1day.env
+# Logs: journalctl -u rsi-bot@1day -f
+[Unit]
+Description=RSI midline bot (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rsibot
+WorkingDirectory=/opt/rsi-midline-bot
+# Variables set here override the repo .env and profiles.json (same
+# precedence the bot uses everywhere: shell env > .env > profile).
+EnvironmentFile=/opt/rsi-midline-bot/deploy/env/%i.env
+ExecStart=/opt/rsi-midline-bot/.venv/bin/python rsi_midline_bot.py loop
+# The loop never exits on its own; any exit is a failure worth retrying,
+# but wait a minute so a crash loop can't hammer the Alpaca API.
+Restart=always
+RestartSec=60
+
+[Install]
+WantedBy=multi-user.target
