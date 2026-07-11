@@ -39,8 +39,10 @@ from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import OrderSide, TimeInForce
-from alpaca.trading.requests import MarketOrderRequest
+from alpaca.trading.enums import (OrderSide, OrderStatus, OrderType,
+                                  QueryOrderStatus, TimeInForce)
+from alpaca.trading.requests import (GetOrdersRequest, MarketOrderRequest,
+                                     TrailingStopOrderRequest)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -131,6 +133,9 @@ class Config:
     # multiple of the recent average (0 = off).
     vol_mult: float = field(default_factory=lambda: float(os.environ.get("VOLUME_MULT", "0")))
     vol_lookback: int = field(default_factory=lambda: int(os.environ.get("VOLUME_LOOKBACK", "20")))
+    # Trailing stop: place a server-side GTC trailing stop this % below the
+    # high-water mark after each entry (0 = off). Whole-share sizing applies.
+    trail_percent: float = field(default_factory=lambda: float(os.environ.get("TRAIL_PERCENT", "0")))
     # Dollar amount per new position.
     notional: float = field(default_factory=lambda: float(os.environ.get("NOTIONAL", "1000")))
     # Seconds between checks in loop mode.
@@ -214,6 +219,11 @@ class TradeLog:
         )
         self.conn.commit()
 
+    def has_order(self, order_id: str) -> bool:
+        return self.conn.execute(
+            "SELECT 1 FROM trades WHERE order_id = ?", (order_id,)
+        ).fetchone() is not None
+
     def recent(self, limit: int = 20) -> list[tuple]:
         return self.conn.execute(
             f"SELECT {','.join(self.COLUMNS)} FROM trades "
@@ -285,30 +295,95 @@ class RsiMidlineBot:
         if self.position_qty(symbol) > 0:
             log.info("%s: buy signal but already long, skipping", symbol)
             return
-        order = self.trading.submit_order(
-            MarketOrderRequest(
-                symbol=symbol,
-                notional=self.cfg.notional,
-                side=OrderSide.BUY,
-                time_in_force=TimeInForce.DAY,
-            )
-        )
-        self._log_trade(symbol, "buy", ctx,
-                        notional=self.cfg.notional, order_id=str(order.id))
+        if self.cfg.trail_percent:
+            # Stop orders need whole shares, so size the entry in shares too.
+            qty = int(self.cfg.notional // ctx["price"])
+            if qty < 1:
+                log.warning("%s: NOTIONAL $%.0f buys < 1 share at %.2f, skipping",
+                            symbol, self.cfg.notional, ctx["price"])
+                return
+            request = MarketOrderRequest(symbol=symbol, qty=qty,
+                                         side=OrderSide.BUY,
+                                         time_in_force=TimeInForce.DAY)
+        else:
+            qty = None
+            request = MarketOrderRequest(symbol=symbol, notional=self.cfg.notional,
+                                         side=OrderSide.BUY,
+                                         time_in_force=TimeInForce.DAY)
+        order = self.trading.submit_order(request)
+        self._log_trade(symbol, "buy", ctx, notional=self.cfg.notional,
+                        qty=qty, order_id=str(order.id))
         log.info("%s: BUY $%.2f submitted (order %s)", symbol, self.cfg.notional, order.id)
+        if self.cfg.trail_percent:
+            self._place_trailing_stop(symbol, order.id, qty)
+
+    def _place_trailing_stop(self, symbol: str, entry_order_id, qty: int) -> None:
+        """Attach a server-side trailing stop once the entry fills.
+
+        GTC on Alpaca's servers, so the position stays protected while the
+        bot sleeps between passes.
+        """
+        for _ in range(30):
+            entry = self.trading.get_order_by_id(entry_order_id)
+            if entry.status == OrderStatus.FILLED:
+                break
+            if entry.status in (OrderStatus.CANCELED, OrderStatus.EXPIRED,
+                                OrderStatus.REJECTED):
+                log.warning("%s: entry order %s ended %s — no stop placed",
+                            symbol, entry_order_id, entry.status)
+                return
+            time.sleep(1)
+        else:
+            log.warning("%s: entry not filled after 30s — no stop placed; "
+                        "position is UNPROTECTED until the next signal", symbol)
+            return
+        stop = self.trading.submit_order(TrailingStopOrderRequest(
+            symbol=symbol, qty=qty, side=OrderSide.SELL,
+            trail_percent=self.cfg.trail_percent, time_in_force=TimeInForce.GTC,
+        ))
+        log.info("%s: trailing stop %.1f%% placed for %d shares (order %s)",
+                 symbol, self.cfg.trail_percent, qty, stop.id)
+
+    def _cancel_open_orders(self, symbol: str) -> None:
+        open_orders = self.trading.get_orders(
+            GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol]))
+        for order in open_orders:
+            self.trading.cancel_order_by_id(order.id)
+            log.info("%s: canceled open %s order %s", symbol, order.type, order.id)
 
     def exit(self, symbol: str, ctx: dict) -> None:
         qty = self.position_qty(symbol)
         if qty <= 0:
             log.info("%s: sell signal but no position, skipping", symbol)
             return
+        # Release shares held by the trailing stop before closing.
+        self._cancel_open_orders(symbol)
         order = self.trading.close_position(symbol)
         self._log_trade(symbol, "sell", ctx, qty=qty, order_id=str(order.id))
         log.info("%s: SELL — position closed (%.4f shares)", symbol, qty)
 
+    def reconcile_stop_fills(self) -> None:
+        """Journal trailing-stop sells that filled while the bot was asleep."""
+        symbols = {s.strip().upper() for s in self.cfg.symbols}
+        closed = self.trading.get_orders(
+            GetOrdersRequest(status=QueryOrderStatus.CLOSED, limit=100))
+        for order in closed:
+            if (order.type == OrderType.TRAILING_STOP
+                    and order.status == OrderStatus.FILLED
+                    and order.symbol in symbols
+                    and not self.journal.has_order(str(order.id))):
+                self._log_trade(order.symbol, "sell", {
+                    "price": float(order.filled_avg_price)}, qty=float(order.filled_qty),
+                    order_id=str(order.id))
+                log.info("%s: trailing stop FIRED at %.2f while bot was away "
+                         "(%.0f shares) — journaled", order.symbol,
+                         float(order.filled_avg_price), float(order.filled_qty))
+
     # -- main passes ----------------------------------------------------------
 
     def run_once(self) -> None:
+        if self.cfg.trail_percent:
+            self.reconcile_stop_fills()
         clock = self.trading.get_clock()
         if not clock.is_open:
             log.info("Market closed (next open %s), skipping pass", clock.next_open)
@@ -390,13 +465,15 @@ class RsiMidlineBot:
         sell_level: float,
         ma_period: int,
         vol_mult: float = 0,
+        trail_pct: float = 0,
         eval_from: int = 0,
         eval_to: int | None = None,
     ) -> tuple[int, float, float]:
         """Simulate one variant; returns (trades, win rate %, total return %).
 
         In the market from the bar after RSI crosses above buy_level until the
-        bar after it crosses below sell_level (signals act on the next bar).
+        bar after RSI crosses below sell_level OR the close drops trail_pct%
+        below the trade's high-water mark (signals act on the next bar).
         eval_from/eval_to restrict *scoring* to a bar range while indicators
         still warm up on the full history (used for walk-forward splits).
         """
@@ -409,10 +486,22 @@ class RsiMidlineBot:
         if vol_mult:
             avg_vol = df["volume"].shift(1).rolling(self.cfg.vol_lookback).mean()
             cross_up &= df["volume"] >= avg_vol * vol_mult
-        state = pd.Series(np.nan, index=closes.index)
-        state[cross_up] = 1.0
-        state[cross_down] = 0.0
-        in_market = state.ffill().fillna(0).shift(1, fill_value=0).astype(bool)
+        # The trailing stop is path-dependent (high-water mark), so walk the
+        # bars to build the in-market series.
+        c = closes.to_numpy()
+        up = cross_up.to_numpy()
+        down = cross_down.to_numpy()
+        in_arr = np.zeros(len(c), dtype=bool)
+        in_pos, hwm = False, 0.0
+        for i in range(len(c)):
+            if in_pos:
+                in_arr[i] = True
+                hwm = max(hwm, c[i])
+                if down[i] or (trail_pct and c[i] <= hwm * (1 - trail_pct / 100)):
+                    in_pos = False
+            if not in_pos and up[i] and not in_arr[i]:
+                in_pos, hwm = True, c[i]
+        in_market = pd.Series(in_arr, index=closes.index)
         bar_returns = closes.pct_change().fillna(0)
         if eval_from or eval_to is not None:
             in_market = in_market.iloc[eval_from:eval_to]
@@ -434,13 +523,16 @@ class RsiMidlineBot:
         log.info("Fetched %d bars", len(bars))
         m = self.cfg.midline
         vm = self.cfg.vol_mult or 1.5
+        tp = self.cfg.trail_percent or 8
         variants = [
-            (f"RSI {m:g} cross", m, m, 0, 0),
-            ("Band 55/45", 55, 45, 0, 0),
-            (f"RSI {m:g} + MA200", m, m, 200, 0),
-            (f"RSI {m:g} + vol x{vm:g}", m, m, 0, vm),
-            (f"Band + vol x{vm:g}", 55, 45, 0, vm),
-            (f"Band + vol + MA200", 55, 45, 200, vm),
+            (f"RSI {m:g} cross", m, m, 0, 0, 0),
+            ("Band 55/45", 55, 45, 0, 0, 0),
+            (f"RSI {m:g} + MA200", m, m, 200, 0, 0),
+            (f"RSI {m:g} + vol x{vm:g}", m, m, 0, vm, 0),
+            (f"Band + vol x{vm:g}", 55, 45, 0, vm, 0),
+            (f"Band + vol + MA200", 55, 45, 200, vm, 0),
+            (f"RSI {m:g} + trail {tp:g}%", m, m, 0, 0, tp),
+            (f"Band + trail {tp:g}%", 55, 45, 0, 0, tp),
         ]
         print(f"\nBacktest: RSI({self.cfg.rsi_period}), timeframe={self.cfg.timeframe}, "
               f"last {self.cfg.backtest_days} days\n(MA200 = 200 bars of this timeframe; "
@@ -458,8 +550,8 @@ class RsiMidlineBot:
             header = f"  {'variant':<22}{'trades':>7}{'win %':>8}{'return':>9}"
             print(header)
             print("  " + "-" * (len(header) - 2))
-            for name, buy, sell, ma, vol in variants:
-                trades, win_rate, total = self.simulate(df, buy, sell, ma, vol)
+            for name, buy, sell, ma, vol, trail in variants:
+                trades, win_rate, total = self.simulate(df, buy, sell, ma, vol, trail)
                 print(f"  {name:<22}{trades:>7}{win_rate:>7.1f}%{total:>+8.1f}%")
         print("\nNote: backtest ignores slippage, commissions, and fills at next-bar close.\n")
 
@@ -468,6 +560,7 @@ class RsiMidlineBot:
     GRID_BANDS = [(50, 50), (55, 45), (60, 40)]
     GRID_MAS = [0, 50, 200]
     GRID_VOLS = [0, 1.5, 2.0]
+    GRID_TRAILS = [0, 5, 10]
 
     def tune(self, write: bool = True) -> None:
         """Grid-search parameters with walk-forward validation.
@@ -492,22 +585,24 @@ class RsiMidlineBot:
             sys.exit("No data for any symbol")
         splits = {s: int(len(df) * split_frac) for s, df in dfs.items()}
 
-        def avg_scores(buy: float, sell: float, ma: int, vol: float) -> dict:
+        def avg_scores(buy: float, sell: float, ma: int, vol: float,
+                       trail: float) -> dict:
             train, test, train_trades, test_trades = [], [], 0, 0
             for sym, df in dfs.items():
                 sp = splits[sym]
-                n_tr, _, r_tr = self.simulate(df, buy, sell, ma, vol, eval_to=sp)
-                n_te, _, r_te = self.simulate(df, buy, sell, ma, vol, eval_from=sp)
+                n_tr, _, r_tr = self.simulate(df, buy, sell, ma, vol, trail, eval_to=sp)
+                n_te, _, r_te = self.simulate(df, buy, sell, ma, vol, trail, eval_from=sp)
                 train.append(r_tr); test.append(r_te)
                 train_trades += n_tr; test_trades += n_te
-            return {"buy": buy, "sell": sell, "ma": ma, "vol": vol,
+            return {"buy": buy, "sell": sell, "ma": ma, "vol": vol, "trail": trail,
                     "train": sum(train) / len(train), "test": sum(test) / len(test),
                     "train_trades": train_trades, "test_trades": test_trades}
 
-        results = [avg_scores(buy, sell, ma, vol)
+        results = [avg_scores(buy, sell, ma, vol, trail)
                    for buy, sell in self.GRID_BANDS
                    for ma in self.GRID_MAS
-                   for vol in self.GRID_VOLS]
+                   for vol in self.GRID_VOLS
+                   for trail in self.GRID_TRAILS]
         # A combo that barely ever trades can "win" by doing nothing; require
         # some in-sample activity before considering it.
         active = [r for r in results if r["train_trades"] >= 2 * len(dfs)] or results
@@ -523,13 +618,15 @@ class RsiMidlineBot:
         print(f"\nTune: {cfg.timeframe}, {cfg.backtest_days} days, "
               f"{len(results)} combos, train {split_frac:.0%} / test {1 - split_frac:.0%} "
               f"(returns averaged across {', '.join(dfs)})\n")
-        header = (f"  {'buy/sell':<10}{'MA':>5}{'vol':>6}"
+        header = (f"  {'buy/sell':<10}{'MA':>5}{'vol':>6}{'trail':>7}"
                   f"{'train %':>10}{'test %':>9}{'test trades':>13}")
         print("  top 5 by TRAIN return — test column is out-of-sample:")
         print(header)
         print("  " + "-" * (len(header) - 2))
         for r in active[:5]:
+            trail_s = f"{r['trail']:g}%" if r["trail"] else "off"
             print(f"  {r['buy']:g}/{r['sell']:<7g}{r['ma']:>5}{r['vol']:>6g}"
+                  f"{trail_s:>7}"
                   f"{r['train']:>+9.1f}%{r['test']:>+8.1f}%{r['test_trades']:>13}")
         print(f"\n  buy & hold on test window: {hold_test:+.1f}%")
 
@@ -537,12 +634,13 @@ class RsiMidlineBot:
         current = self._current_profile_combo()
         cur = avg_scores(*current)
         print(f"  current profile ({current[0]:g}/{current[1]:g}, MA {current[2]}, "
-              f"vol x{current[3]:g}) on test window: {cur['test']:+.1f}%")
+              f"vol x{current[3]:g}, trail {current[4]:g}%) on test window: {cur['test']:+.1f}%")
 
         if winner["test"] < winner["train"] / 3:
             print("\n  WARNING: winner's out-of-sample return is far below its "
                   "training return — likely overfit to the training window.")
-        if (winner["buy"], winner["sell"], winner["ma"], winner["vol"]) == current:
+        if (winner["buy"], winner["sell"], winner["ma"], winner["vol"],
+                winner["trail"]) == current:
             print("\nVerdict: current profile is already the winner — nothing to update.\n")
             return
         if winner["test"] <= cur["test"]:
@@ -578,17 +676,18 @@ class RsiMidlineBot:
     def _profiles_path(self) -> str:
         return os.path.join(os.path.dirname(os.path.abspath(__file__)), "profiles.json")
 
-    def _current_profile_combo(self) -> tuple[float, float, int, float]:
-        """Current profile's (buy, sell, ma, vol), falling back to plain midline."""
+    def _current_profile_combo(self) -> tuple[float, float, int, float, float]:
+        """Current profile's (buy, sell, ma, vol, trail), falling back to plain midline."""
         try:
             with open(self._profiles_path()) as f:
                 s = json.load(f)[self.cfg.timeframe]["settings"]
             return (float(s.get("RSI_BUY_LEVEL", self.cfg.midline)),
                     float(s.get("RSI_SELL_LEVEL", self.cfg.midline)),
                     int(s.get("TREND_MA_PERIOD", 0)),
-                    float(s.get("VOLUME_MULT", 0)))
+                    float(s.get("VOLUME_MULT", 0)),
+                    float(s.get("TRAIL_PERCENT", 0)))
         except (OSError, KeyError, ValueError):
-            return (self.cfg.midline, self.cfg.midline, 0, 0)
+            return (self.cfg.midline, self.cfg.midline, 0, 0, 0)
 
     def _write_profile(self, winner: dict, hold_test: float,
                        split_frac: float, symbols: list[str]) -> None:
@@ -604,6 +703,7 @@ class RsiMidlineBot:
             "TREND_MA_PERIOD": str(winner["ma"]),
             "VOLUME_MULT": f"{winner['vol']:g}",
             "VOLUME_LOOKBACK": str(self.cfg.vol_lookback),
+            "TRAIL_PERCENT": f"{winner['trail']:g}",
         }
         if "POLL_SECONDS" in old:  # tune doesn't search this; keep the old value
             settings["POLL_SECONDS"] = old["POLL_SECONDS"]
@@ -616,7 +716,8 @@ class RsiMidlineBot:
                 f"walk-forward split. Train avg {winner['train']:+.1f}%, "
                 f"out-of-sample test avg {winner['test']:+.1f}% vs buy&hold "
                 f"{hold_test:+.1f}% on the test window ({winner['test_trades']} test trades). "
-                f"Grid: bands {self.GRID_BANDS}, MA {self.GRID_MAS}, vol {self.GRID_VOLS}."
+                f"Grid: bands {self.GRID_BANDS}, MA {self.GRID_MAS}, "
+                f"vol {self.GRID_VOLS}, trail% {self.GRID_TRAILS}."
             ),
             "settings": settings,
         }

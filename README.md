@@ -100,6 +100,19 @@ Everything is set via environment variables (see `.env.example`):
 | `TREND_MA_PERIOD` | `0` (off) | Only buy when price is above this MA (in bars) |
 | `VOLUME_MULT` | `0` (off) | Only buy when signal-bar volume ≥ this × recent average |
 | `VOLUME_LOOKBACK` | `20` | Bars used for the average-volume baseline |
+| `TRAIL_PERCENT` | `0` (off) | Trailing stop % below high-water mark (server-side GTC) |
+
+### Trailing stops
+
+With `TRAIL_PERCENT` set, each entry places a **server-side** trailing stop on
+Alpaca (GTC), so the position stays protected while the bot sleeps between
+passes — important on the daily timeframe, where the bot only wakes near the
+close. Details: entries switch to whole-share sizing (stop orders can't hold
+fractional shares); an RSI exit cancels the stop before closing; stop fills
+that happen while the bot is away are journaled on the next pass. Note the
+tuner optimizes *return*, where stops rarely win — their real job is capping
+drawdown, so setting a wide one (e.g. 10-15%) manually as disaster insurance
+is reasonable even if the backtest says it costs a little return.
 | `NOTIONAL` | `1000` | Dollars per new position |
 | `POLL_SECONDS` | `60` | Loop-mode check interval |
 | `BACKTEST_DAYS` | `365` | History window for backtests |
