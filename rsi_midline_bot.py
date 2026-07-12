@@ -19,6 +19,8 @@ Usage:
                                          # holds up out-of-sample (--dry-run to
                                          # only report)
     python rsi_midline_bot.py trades     # show the trade journal (SQLite)
+    python rsi_midline_bot.py pnl [db..] # round-trip P&L / losing-trade stats
+                                         # from the journal(s)
 """
 
 from __future__ import annotations
@@ -137,6 +139,8 @@ class Config:
         os.environ.get("RSI_SELL_LEVEL", os.environ.get("MIDLINE", "50"))))
     # Trend filter: only buy when price is above this moving average (0 = off).
     trend_ma: int = field(default_factory=lambda: int(os.environ.get("TREND_MA_PERIOD", "0")))
+    # Moving-average type for the trend filter: sma | ema | hma.
+    ma_type: str = field(default_factory=lambda: os.environ.get("MA_TYPE", "sma"))
     # Volume filter: only buy when the signal bar's volume is at least this
     # multiple of the recent average (0 = off).
     vol_mult: float = field(default_factory=lambda: float(os.environ.get("VOLUME_MULT", "0")))
@@ -145,6 +149,11 @@ class Config:
     # this MA on HTF_TIMEFRAME bars resampled from the trading bars (0 = off).
     htf_ma: int = field(default_factory=lambda: int(os.environ.get("HTF_MA_PERIOD", "0")))
     htf_timeframe: str = field(default_factory=lambda: os.environ.get("HTF_TIMEFRAME", "1Hour"))
+    # Multi-timeframe RSI confirmation: only buy when RSI(RSI_PERIOD) on
+    # HTF_TIMEFRAME bars is above this level (0 = off). Same no-look-ahead
+    # resampling as the HTF MA filter; intraday trading timeframes only.
+    htf_rsi_level: float = field(
+        default_factory=lambda: float(os.environ.get("HTF_RSI_LEVEL", "0")))
     # Trailing stop: place a server-side GTC trailing stop this % below the
     # high-water mark after each entry (0 = off). Whole-share sizing applies.
     trail_percent: float = field(default_factory=lambda: float(os.environ.get("TRAIL_PERCENT", "0")))
@@ -187,6 +196,27 @@ def rsi(close: pd.Series, period: int = 14) -> pd.Series:
     return 100 - (100 / (1 + rs))
 
 
+def wma(s: pd.Series, period: int) -> pd.Series:
+    """Linearly weighted moving average (most recent bar weighted highest)."""
+    w = np.arange(1, period + 1, dtype=float)
+    return s.rolling(period).apply(lambda x: np.dot(x, w) / w.sum(), raw=True)
+
+
+def ma_series(close: pd.Series, period: int, kind: str = "sma") -> pd.Series:
+    """Moving average of the requested type: sma | ema | hma.
+
+    HMA = WMA(2*WMA(n/2) - WMA(n), sqrt(n)) — Hull's reduced-lag average.
+    """
+    if kind == "sma":
+        return close.rolling(period).mean()
+    if kind == "ema":
+        return close.ewm(span=period, min_periods=period, adjust=False).mean()
+    if kind == "hma":
+        raw = 2 * wma(close, max(period // 2, 1)) - wma(close, period)
+        return wma(raw, max(int(np.sqrt(period)), 1))
+    raise ValueError(f"MA_TYPE must be sma, ema, or hma (got {kind!r})")
+
+
 def crossover_signal(
     rsi_series: pd.Series, buy_level: float, sell_level: float | None = None
 ) -> str | None:
@@ -207,22 +237,44 @@ def crossover_signal(
     return None
 
 
+def _htf_align(ok: pd.Series, index: pd.DatetimeIndex,
+               bar_len: timedelta) -> pd.Series:
+    """Align a boolean HTF-bar series back onto the trading-bar index so each
+    trading bar only sees HTF bars that had fully closed by the time the
+    trading bar itself closed — no look-ahead."""
+    # A bar indexed at t closes at t + bar_len; HTF bars are indexed at their
+    # end time, so ffill picks the latest HTF bar that ended by then. Bars
+    # before the first HTF close reindex to NaN, which != 1.0 -> False.
+    aligned = ok.astype(float).reindex(index + bar_len, method="ffill")
+    return pd.Series(aligned.to_numpy() == 1.0, index=index)
+
+
+def _htf_closes(df: pd.DataFrame, rule: str) -> pd.Series:
+    return df["close"].resample(rule, label="right", closed="left").last().dropna()
+
+
 def htf_trend_ok(df: pd.DataFrame, rule: str, ma_period: int,
                  bar_len: timedelta) -> pd.Series:
     """True where the higher-timeframe trend is up (HTF close above its MA).
 
-    Resamples the trading-timeframe bars up to the higher timeframe, then
-    aligns back so each trading bar only sees HTF bars that had fully closed
-    by the time the trading bar itself closed — no look-ahead. NaN warmup
-    (fewer than ma_period HTF bars) counts as trend-down, like the trend MA.
+    Resamples the trading-timeframe bars up to the higher timeframe. NaN
+    warmup (fewer than ma_period HTF bars) counts as trend-down, like the
+    trend MA.
     """
-    htf_close = df["close"].resample(rule, label="right", closed="left").last().dropna()
+    htf_close = _htf_closes(df, rule)
     ok = htf_close > htf_close.rolling(ma_period).mean()
-    # A bar indexed at t closes at t + bar_len; HTF bars are indexed at their
-    # end time, so ffill picks the latest HTF bar that ended by then. Bars
-    # before the first HTF close reindex to NaN, which != 1.0 -> False.
-    aligned = ok.astype(float).reindex(df.index + bar_len, method="ffill")
-    return pd.Series(aligned.to_numpy() == 1.0, index=df.index)
+    return _htf_align(ok, df.index, bar_len)
+
+
+def htf_rsi_ok(df: pd.DataFrame, rule: str, level: float, period: int,
+               bar_len: timedelta) -> pd.Series:
+    """True where RSI on the higher timeframe is above `level`.
+
+    Same resample/align (no look-ahead) as htf_trend_ok; RSI warmup counts
+    as not-ok."""
+    htf_close = _htf_closes(df, rule)
+    ok = rsi(htf_close, period) > level
+    return _htf_align(ok, df.index, bar_len)
 
 
 # ---------------------------------------------------------------------------
@@ -234,7 +286,7 @@ class TradeLog:
 
     COLUMNS = ("ts", "symbol", "side", "price", "notional", "qty", "order_id",
                "rsi", "rvol", "timeframe", "rsi_buy", "rsi_sell", "trend_ma",
-               "vol_mult", "htf_ma", "paper")
+               "vol_mult", "htf_ma", "ma_type", "htf_rsi", "paper")
 
     def __init__(self, path: str):
         self.conn = sqlite3.connect(path)
@@ -253,12 +305,18 @@ class TradeLog:
                 timeframe TEXT,
                 rsi_buy REAL, rsi_sell REAL, trend_ma INTEGER, vol_mult REAL,
                 htf_ma INTEGER,            -- higher-timeframe trend MA (0 = off)
+                ma_type TEXT,              -- trend-MA type: sma / ema / hma
+                htf_rsi REAL,              -- higher-timeframe RSI level (0 = off)
                 paper INTEGER
             )""")
-        try:  # migrate journals created before the HTF filter existed
-            self.conn.execute("ALTER TABLE trades ADD COLUMN htf_ma INTEGER")
-        except sqlite3.OperationalError:
-            pass
+        # Migrate journals created before newer filter columns existed.
+        for ddl in ("ALTER TABLE trades ADD COLUMN htf_ma INTEGER",
+                    "ALTER TABLE trades ADD COLUMN ma_type TEXT",
+                    "ALTER TABLE trades ADD COLUMN htf_rsi REAL"):
+            try:
+                self.conn.execute(ddl)
+            except sqlite3.OperationalError:
+                pass
         self.conn.commit()
 
     def record(self, **f) -> None:
@@ -282,6 +340,75 @@ class TradeLog:
         ).fetchall()[::-1]
 
 
+def show_pnl(db_paths: list[str] | None = None) -> None:
+    """Round-trip P&L from the journal: pair each sell with its open buy.
+
+    Long-only with one position per symbol, so pairing is trivial. Prices
+    are the journaled signal-bar closes (trailing-stop rows use the real
+    fill), so returns exclude slippage/fees — treat as close-to-close.
+    Accepts multiple DB paths to report each deployed instance in turn;
+    opens them read-only so it never migrates someone else's journal.
+    Needs no API keys — main() dispatches it before the credential check.
+    """
+    default = os.environ.get("TRADES_DB") or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "trades.db")
+    for path in db_paths or [default]:
+        print(f"\n=== {path} ===")
+        if not os.path.exists(path):
+            print("  no such file")
+            continue
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        rows = conn.execute(
+            "SELECT ts, symbol, side, price FROM trades ORDER BY id"
+        ).fetchall()
+        conn.close()
+        open_pos: dict[str, tuple[str, float]] = {}
+        trips: list[tuple] = []
+        orphans = 0
+        for ts, sym, side, price in rows:
+            if price is None:
+                orphans += 1
+            elif side == "buy":
+                # Double buys shouldn't happen (enter() skips when long);
+                # keep the first entry if one slips through.
+                open_pos.setdefault(sym, (ts, price))
+            elif sym in open_pos:
+                ets, ep = open_pos.pop(sym)
+                trips.append((sym, ets, ts, ep, price, (price / ep - 1) * 100))
+            else:
+                orphans += 1  # sell with no journaled buy
+        if not trips and not open_pos:
+            print(f"  no round trips yet ({len(rows)} journal rows)")
+            continue
+        if trips:
+            header = (f"  {'symbol':<7}{'entry (UTC)':<18}{'exit (UTC)':<18}"
+                      f"{'in':>9}{'out':>9}{'return':>9}{'held':>8}")
+            print(header)
+            print("  " + "-" * (len(header) - 2))
+        for sym, ets, xts, ep, xp, ret in trips:
+            held = (datetime.fromisoformat(xts) - datetime.fromisoformat(ets))
+            held_s = (f"{held.days}d" if held.days
+                      else f"{held.seconds // 3600}h{held.seconds % 3600 // 60:02d}")
+            print(f"  {sym:<7}{ets[:16]:<18}{xts[:16]:<18}"
+                  f"{ep:>9.2f}{xp:>9.2f}{ret:>+8.2f}%{held_s:>8}")
+        for sym, (ets, ep) in sorted(open_pos.items()):
+            print(f"  {sym:<7}{ets[:16]:<18}{'(still open)':<18}{ep:>9.2f}")
+        if trips:
+            rets = [t[5] for t in trips]
+            losses = [r for r in rets if r <= 0]
+            wins = [r for r in rets if r > 0]
+            cum = float(np.prod([1 + r / 100 for r in rets]) - 1) * 100
+            print(f"\n  {len(trips)} closed: {len(wins)} won, {len(losses)} "
+                  f"lost ({len(losses) / len(trips) * 100:.0f}% losing)"
+                  + (f" | avg win {sum(wins) / len(wins):+.2f}%" if wins else "")
+                  + (f" | avg loss {sum(losses) / len(losses):+.2f}%" if losses else "")
+                  + f" | expectancy {sum(rets) / len(rets):+.2f}%/trade"
+                  f" | compounded {cum:+.2f}%")
+        if orphans:
+            print(f"  ({orphans} unmatched rows skipped — e.g. sells of "
+                  f"positions opened before journaling)")
+
+
 # ---------------------------------------------------------------------------
 # Bot
 # ---------------------------------------------------------------------------
@@ -293,8 +420,10 @@ class RsiMidlineBot:
         self.data = StockHistoricalDataClient(cfg.api_key, cfg.secret_key)
         if cfg.timeframe not in TIMEFRAMES:
             raise ValueError(f"TIMEFRAME must be one of {list(TIMEFRAMES)}")
-        if cfg.htf_ma and cfg.htf_timeframe not in HTF_RULES:
+        if (cfg.htf_ma or cfg.htf_rsi_level) and cfg.htf_timeframe not in HTF_RULES:
             raise ValueError(f"HTF_TIMEFRAME must be one of {list(HTF_RULES)}")
+        if cfg.ma_type not in ("sma", "ema", "hma"):
+            raise ValueError(f"MA_TYPE must be sma, ema, or hma (got {cfg.ma_type!r})")
         if cfg.bar_adjustment not in [a.value for a in Adjustment]:
             raise ValueError(
                 f"BAR_ADJUSTMENT must be one of {[a.value for a in Adjustment]}")
@@ -351,6 +480,7 @@ class RsiMidlineBot:
             timeframe=self.cfg.timeframe, rsi_buy=self.cfg.rsi_buy,
             rsi_sell=self.cfg.rsi_sell, trend_ma=self.cfg.trend_ma,
             vol_mult=self.cfg.vol_mult, htf_ma=self.cfg.htf_ma,
+            ma_type=self.cfg.ma_type, htf_rsi=self.cfg.htf_rsi_level,
             paper=int(self.cfg.paper), **extra,
         )
 
@@ -479,12 +609,15 @@ class RsiMidlineBot:
             days = max(200, int((self.cfg.trend_ma + self.cfg.rsi_period) * 1.6) + 30)
         else:
             days = 60 if self.cfg.trend_ma else 30
-            if self.cfg.htf_ma:
-                # The HTF filter needs htf_ma *higher-timeframe* bars or its
-                # rolling MA is all-NaN and every buy gets vetoed (a 1Day MA50
+            if self.cfg.htf_ma or self.cfg.htf_rsi_level:
+                # The HTF filters need enough *higher-timeframe* bars or their
+                # MA/RSI is all-NaN and every buy gets vetoed (a 1Day MA50
                 # needs ~50 trading days — far more than the base 30 calendar).
+                # Wilder RSI needs ~3x its period to converge after warmup.
+                htf_bars = max(self.cfg.htf_ma,
+                               3 * self.cfg.rsi_period if self.cfg.htf_rsi_level else 0)
                 htf_hours = {"1Hour": 1, "4Hour": 4, "1Day": 6.5}[self.cfg.htf_timeframe]
-                htf_trading_days = self.cfg.htf_ma * htf_hours / 6.5
+                htf_trading_days = htf_bars * htf_hours / 6.5
                 days = max(days, int(htf_trading_days * 1.6) + 10)
         bars = self.fetch_bars(self.cfg.symbols, days=days)
         for symbol in self.cfg.symbols:
@@ -517,10 +650,11 @@ class RsiMidlineBot:
                              symbol, f"{rvol:.2f}" if rvol else "n/a", self.cfg.vol_mult)
                     signal = None
             if signal == "buy" and self.cfg.trend_ma:
-                ma = closes.rolling(self.cfg.trend_ma).mean().iloc[-1]
+                ma = ma_series(closes, self.cfg.trend_ma, self.cfg.ma_type).iloc[-1]
                 if pd.isna(ma) or closes.iloc[-1] <= ma:
-                    log.info("%s: buy signal vetoed by trend filter (price %.2f <= MA%d %.2f)",
-                             symbol, closes.iloc[-1], self.cfg.trend_ma, ma)
+                    log.info("%s: buy signal vetoed by trend filter (price %.2f <= %s%d %.2f)",
+                             symbol, closes.iloc[-1], self.cfg.ma_type.upper(),
+                             self.cfg.trend_ma, ma)
                     signal = None
             # HTF confirmation only applies when resampling *up* from an
             # intraday timeframe — same gate the backtest applies.
@@ -532,6 +666,16 @@ class RsiMidlineBot:
                     log.info("%s: buy signal vetoed by HTF trend filter "
                              "(%s close below MA%d)", symbol,
                              self.cfg.htf_timeframe, self.cfg.htf_ma)
+                    signal = None
+            if (signal == "buy" and self.cfg.htf_rsi_level
+                    and self.timeframe.unit != TimeFrameUnit.Day):
+                rsi_up = htf_rsi_ok(df, HTF_RULES[self.cfg.htf_timeframe],
+                                    self.cfg.htf_rsi_level, self.cfg.rsi_period,
+                                    self.bar_len()).iloc[-1]
+                if not rsi_up:
+                    log.info("%s: buy signal vetoed by HTF RSI filter "
+                             "(%s RSI below %g)", symbol,
+                             self.cfg.htf_timeframe, self.cfg.htf_rsi_level)
                     signal = None
             log.info("%s: RSI=%.1f signal=%s", symbol, r.iloc[-1], signal or "none")
             ctx = {"price": float(closes.iloc[-1]), "rsi": float(r.iloc[-1]), "rvol": rvol}
@@ -588,13 +732,20 @@ class RsiMidlineBot:
         cross_up = (r > buy_level) & (r.shift(1) <= buy_level)
         cross_down = (r < sell_level) & (r.shift(1) >= sell_level)
         if ma_period:
-            cross_up &= closes > closes.rolling(ma_period).mean()
+            cross_up &= closes > ma_series(closes, ma_period, self.cfg.ma_type)
         if vol_mult:
             avg_vol = df["volume"].shift(1).rolling(self.cfg.vol_lookback).mean()
             cross_up &= df["volume"] >= avg_vol * vol_mult
         if htf_ma:
             cross_up &= htf_trend_ok(df, HTF_RULES[self.cfg.htf_timeframe],
                                      htf_ma, self.bar_len())
+        # HTF RSI confirmation is a cfg-level filter (not a per-variant param):
+        # when set, it gates EVERY variant in a backtest run — variant names
+        # get a suffix so backtest_results.csv rows stay unambiguous.
+        if self.cfg.htf_rsi_level and self.timeframe.unit != TimeFrameUnit.Day:
+            cross_up &= htf_rsi_ok(df, HTF_RULES[self.cfg.htf_timeframe],
+                                   self.cfg.htf_rsi_level, self.cfg.rsi_period,
+                                   self.bar_len())
         return cross_up, cross_down
 
     def simulate_portfolio(
@@ -794,10 +945,20 @@ class RsiMidlineBot:
                  f"bars resampled from this timeframe)" if htf_ok else ")"))
         print(f"'active settings' = resolved config (env > .env > profile): "
               f"band {self.cfg.rsi_buy:g}/{self.cfg.rsi_sell:g}, "
-              f"MA {self.cfg.trend_ma}, vol x{self.cfg.vol_mult:g}, "
+              f"MA {self.cfg.trend_ma} ({self.cfg.ma_type}), "
+              f"vol x{self.cfg.vol_mult:g}, "
               f"trail {self.cfg.trail_percent:g}%"
               + (f", {self.cfg.htf_timeframe} MA{self.cfg.htf_ma}"
                  if htf_ok and self.cfg.htf_ma else ""))
+        # These two knobs are cfg-global (not per-variant), so when set they
+        # gate every row below; tag the names so the CSV log stays unambiguous.
+        suffix = ""
+        if self.cfg.ma_type != "sma":
+            suffix += f" [{self.cfg.ma_type}]"
+        if htf_ok and self.cfg.htf_rsi_level:
+            print(f"GLOBAL FILTER on all variants: {self.cfg.htf_timeframe} "
+                  f"RSI > {self.cfg.htf_rsi_level:g}")
+            suffix += f" [+{ht} RSI>{self.cfg.htf_rsi_level:g}]"
         results = []
         run_ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
         for symbol in self.cfg.symbols:
@@ -814,6 +975,7 @@ class RsiMidlineBot:
             print(header)
             print("  " + "-" * (len(header) - 2))
             for name, buy, sell, ma, vol, trail, htf in variants:
+                name += suffix
                 trades, win_rate, total = self.simulate(df, buy, sell, ma, vol,
                                                         trail, htf)
                 print(f"  {name:<26}{trades:>7}{win_rate:>7.1f}%{total:>+8.1f}%")
@@ -872,10 +1034,12 @@ class RsiMidlineBot:
               f"days, {', '.join(dfs)}\nstart ${cfg.start_equity:g}, entries "
               f"{sizing} (cash-capped), COST_BPS={cfg.cost_bps:g}/side, "
               f"adjustment='{cfg.bar_adjustment}'")
-        print(f"band {cfg.rsi_buy:g}/{cfg.rsi_sell:g}, MA {cfg.trend_ma}, "
-              f"vol x{cfg.vol_mult:g}, trail {cfg.trail_percent:g}%"
+        print(f"band {cfg.rsi_buy:g}/{cfg.rsi_sell:g}, MA {cfg.trend_ma} "
+              f"({cfg.ma_type}), vol x{cfg.vol_mult:g}, trail {cfg.trail_percent:g}%"
               + (f", {cfg.htf_timeframe} MA{cfg.htf_ma}"
-                 if htf_ok and cfg.htf_ma else ""))
+                 if htf_ok and cfg.htf_ma else "")
+              + (f", {cfg.htf_timeframe} RSI>{cfg.htf_rsi_level:g}"
+                 if htf_ok and cfg.htf_rsi_level else ""))
         print(f"\n  {'':<14}{'return':>9}{'CAGR':>8}{'max DD':>8}")
         print(f"  {'strategy':<14}{res['return_pct']:>+8.1f}%"
               f"{res['cagr_pct']:>+7.1f}%{res['max_dd_pct']:>7.1f}%")
@@ -894,7 +1058,10 @@ class RsiMidlineBot:
             "run_ts": run_ts, "timeframe": cfg.timeframe,
             "days": cfg.backtest_days, "rsi_period": cfg.rsi_period,
             "symbol": "PORTFOLIO",
-            "variant": f"portfolio {sizing}, {cfg.cost_bps:g}bps",
+            "variant": (f"portfolio {sizing}, {cfg.cost_bps:g}bps"
+                        + (f" [{cfg.ma_type}]" if cfg.ma_type != "sma" else "")
+                        + (f" [+{cfg.htf_timeframe} RSI>{cfg.htf_rsi_level:g}]"
+                           if htf_ok and cfg.htf_rsi_level else "")),
             "rsi_buy": cfg.rsi_buy, "rsi_sell": cfg.rsi_sell,
             "trend_ma": cfg.trend_ma, "vol_mult": cfg.vol_mult,
             "trail_pct": cfg.trail_percent,
@@ -1098,10 +1265,13 @@ class RsiMidlineBot:
 
 def main() -> None:
     mode = sys.argv[1] if len(sys.argv) > 1 else "run"
-    if mode not in ("run", "loop", "backtest", "portfolio", "tune", "trades"):
+    if mode not in ("run", "loop", "backtest", "portfolio", "tune", "trades", "pnl"):
         print(__doc__)
         sys.exit(1)
     load_dotenv()
+    if mode == "pnl":  # journal analysis only — needs no API keys
+        show_pnl(sys.argv[2:] or None)
+        return
     if not os.environ.get("ALPACA_API_KEY") or not os.environ.get("ALPACA_SECRET_KEY"):
         sys.exit(
             "Missing ALPACA_API_KEY / ALPACA_SECRET_KEY.\n"

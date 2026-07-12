@@ -42,6 +42,8 @@ ssh root@SERVER systemctl status 'rsi-bot@*'            # are they alive?
 ssh root@SERVER journalctl -u rsi-bot@15min --since today
 ssh root@SERVER -t 'cd /opt/rsi-midline-bot && \
     TRADES_DB=trades-15min.db .venv/bin/python rsi_midline_bot.py trades 30'
+ssh root@SERVER -t 'cd /opt/rsi-midline-bot && \
+    .venv/bin/python rsi_midline_bot.py pnl trades-*.db'   # win/loss stats per bot
 ssh root@SERVER systemctl stop rsi-bot@1hour            # pause one bot
 ```
 

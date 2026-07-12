@@ -22,6 +22,8 @@ append-only experiment log every backtest writes to).
 .venv/bin/python rsi_midline_bot.py tune       # grid search + walk-forward; may write profiles.json
 .venv/bin/python rsi_midline_bot.py tune --dry-run
 .venv/bin/python rsi_midline_bot.py trades 50  # show trade journal
+.venv/bin/python rsi_midline_bot.py pnl [db..] # round-trip P&L + losing-trade %
+                                               # from journal(s); read-only
 ```
 
 - The venv is Python **3.9** — keep `from __future__ import annotations`; no 3.10+ syntax at runtime.
@@ -94,6 +96,11 @@ Don't bypass that gate; when editing profiles by hand, update the notes.
   alignment (HTF bars are indexed at their end time; ffill onto
   `index + bar_len`). Disabled when trading `1Day`. Not in the tune grid;
   test HTF candidates via `backtest` env overrides (`active settings` row).
+- `MA_TYPE` (sma/ema/hma, applies to the trend MA) and `HTF_RSI_LEVEL`
+  (HTF RSI confirmation) are cfg-global, not per-variant `simulate()` params:
+  when set they affect **every** backtest variant in the run, and variant
+  names get a `[...]` suffix so `backtest_results.csv` rows stay unambiguous.
+  Neither is in the tune grid.
 
 ## Live-trading invariants
 
@@ -159,3 +166,18 @@ evidence in `backtest_results.csv`):
 - The three paper-trading candidates (one per timeframe) are encoded in
   `deploy/env/*.env.example`, each on its own Alpaca paper account to avoid
   position collisions.
+
+From the 2026-07-12 filter experiments (QQQ/GLD/IWM/SPY, adjustment=all,
+frictionless, `EXP *` rows in `backtest_results.csv`):
+
+- Multi-timeframe RSI confirmation (`HTF_RSI_LEVEL`, HTF RSI must be > level
+  to buy) was tested on 1Hour (1D RSI>50) and 15Min (1h and 1D RSI>50):
+  **worse everywhere**, full-window and out-of-sample, alone or stacked on
+  the HTF MA — it lags price and re-allows entries late. Rejected; the knob
+  exists but stays 0.
+- Trend-MA type (`MA_TYPE`: sma/ema/hma) on 1Day 55/40 over 1095d: HMA50 and
+  EMA50 beat-or-match the deployed SMA50 on every symbol full-window (avg
+  +76.7% / +74.5% vs +67.7%; unfiltered +68.7%). All differences sit in the
+  2025 downtrend (training window) — the last-30% OOS window had no vetoes,
+  so every MA50 variant scores identically OOS and the tune gate cannot
+  distinguish them. HMA200 whipsaws badly (+16.7%); avoid HMA at long periods.
