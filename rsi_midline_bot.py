@@ -146,6 +146,9 @@ class Config:
     trail_percent: float = field(default_factory=lambda: float(os.environ.get("TRAIL_PERCENT", "0")))
     # Dollar amount per new position.
     notional: float = field(default_factory=lambda: float(os.environ.get("NOTIONAL", "1000")))
+    # Position size as a percent of current account equity (0 = off, use the
+    # flat NOTIONAL). Capped by available cash so entries never use margin.
+    notional_pct: float = field(default_factory=lambda: float(os.environ.get("NOTIONAL_PCT", "0")))
     # Seconds between checks in loop mode.
     poll_seconds: int = field(default_factory=lambda: int(os.environ.get("POLL_SECONDS", "60")))
     # Days of history to backtest.
@@ -330,29 +333,52 @@ class RsiMidlineBot:
             paper=int(self.cfg.paper), **extra,
         )
 
+    def position_notional(self) -> float:
+        """Dollars for a new position.
+
+        NOTIONAL_PCT sizes off current equity so the account compounds like
+        the backtest assumes, capped by available cash so a burst of signals
+        can't lean on margin. Flat NOTIONAL keeps the legacy behavior.
+        """
+        if not self.cfg.notional_pct:
+            return self.cfg.notional
+        acct = self.trading.get_account()
+        notional = float(acct.equity) * self.cfg.notional_pct / 100
+        cash = float(acct.cash)
+        if notional > cash:
+            log.info("sizing: %.0f%% of equity $%.2f capped by cash to $%.2f",
+                     self.cfg.notional_pct, float(acct.equity), cash)
+            notional = cash
+        return round(notional, 2)
+
     def enter(self, symbol: str, ctx: dict) -> None:
         if self.position_qty(symbol) > 0:
             log.info("%s: buy signal but already long, skipping", symbol)
             return
+        notional = self.position_notional()
+        if notional < 1:  # Alpaca's minimum for notional orders
+            log.warning("%s: buy skipped — position size $%.2f below $1 minimum "
+                        "(no free cash?)", symbol, notional)
+            return
         if self.cfg.trail_percent:
             # Stop orders need whole shares, so size the entry in shares too.
-            qty = int(self.cfg.notional // ctx["price"])
+            qty = int(notional // ctx["price"])
             if qty < 1:
-                log.warning("%s: NOTIONAL $%.0f buys < 1 share at %.2f, skipping",
-                            symbol, self.cfg.notional, ctx["price"])
+                log.warning("%s: $%.0f buys < 1 share at %.2f, skipping",
+                            symbol, notional, ctx["price"])
                 return
             request = MarketOrderRequest(symbol=symbol, qty=qty,
                                          side=OrderSide.BUY,
                                          time_in_force=TimeInForce.DAY)
         else:
             qty = None
-            request = MarketOrderRequest(symbol=symbol, notional=self.cfg.notional,
+            request = MarketOrderRequest(symbol=symbol, notional=notional,
                                          side=OrderSide.BUY,
                                          time_in_force=TimeInForce.DAY)
         order = self.trading.submit_order(request)
-        self._log_trade(symbol, "buy", ctx, notional=self.cfg.notional,
+        self._log_trade(symbol, "buy", ctx, notional=notional,
                         qty=qty, order_id=str(order.id))
-        log.info("%s: BUY $%.2f submitted (order %s)", symbol, self.cfg.notional, order.id)
+        log.info("%s: BUY $%.2f submitted (order %s)", symbol, notional, order.id)
         if self.cfg.trail_percent:
             self._place_trailing_stop(symbol, order.id, qty)
 

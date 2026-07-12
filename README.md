@@ -8,6 +8,11 @@ A long-only Python trading bot for Alpaca implementing the **RSI midline strateg
 RSI uses Wilder's smoothing, and signals only fire on completed bars so a
 still-forming intraday bar can't trigger a trade.
 
+Optional filters gate the entries: an RSI band (buy/sell at different levels
+instead of one midline), a trend moving average, a volume-confirmation
+multiple, a **higher-timeframe trend check** (e.g. trade 15-minute bars only
+while the 1-hour trend is up), and a server-side trailing stop.
+
 ## Setup
 
 ```bash
@@ -34,6 +39,23 @@ python rsi_midline_bot.py tune      # grid-search + walk-forward validation
 python rsi_midline_bot.py trades    # show the trade journal (add a number for more rows)
 ```
 
+### Backtesting variants & the experiment log
+
+`backtest` compares a menu of strategy variants side-by-side (plain cross,
+band, trend MA, volume, trailing stop, higher-timeframe trend confirmation)
+plus an **`active settings`** row built from your resolved configuration.
+Since shell variables override everything, that row lets you A/B any
+candidate profile without touching config files:
+
+```bash
+TIMEFRAME=15Min RSI_BUY_LEVEL=60 RSI_SELL_LEVEL=40 HTF_MA_PERIOD=20 \
+  python rsi_midline_bot.py backtest
+```
+
+Every run also appends one row per symbol/variant to `backtest_results.csv`
+(timestamp, full parameter set, trades, win rate, return, buy & hold), so
+experiments stay comparable long after the terminal scrollback is gone.
+
 ### Trade journal
 
 Every order is recorded in `trades.db` (SQLite, gitignored) with the full
@@ -47,8 +69,8 @@ to change the location.
 
 ### Tune mode
 
-`tune` grid-searches band levels × trend MA × volume filter (27 combos) for
-the current `TIMEFRAME`, with honest walk-forward validation:
+`tune` grid-searches band levels × trend MA × volume filter × trailing stop
+(81 combos) for the current `TIMEFRAME`, with honest walk-forward validation:
 
 1. The winner is picked on the **first 70%** of history only (train).
 2. It's then evaluated on the held-out **last 30%** (test) it never saw.
@@ -59,7 +81,8 @@ the current `TIMEFRAME`, with honest walk-forward validation:
 A combo that shines in train but collapses in test is overfit; the gate
 exists to keep those out of your profiles. Set `TRAIN_SPLIT` (default `0.7`)
 to change the split, and `BACKTEST_DAYS` to widen the history (use 1000+ for
-`1Day`).
+`1Day`). The grid does **not** search the higher-timeframe filter — test
+those candidates via `backtest` with env overrides (see above).
 
 ## Per-timeframe profiles
 
@@ -72,15 +95,21 @@ Precedence: anything set explicitly in `.env` or the shell **overrides** the
 profile — profiles only fill in settings you haven't chosen yourself. The
 startup log shows exactly which values came from the profile.
 
-Current findings (tuned 2026-07-10 on SPY/AAPL/MSFT):
+Current findings (walk-forward tested 2026-07-11 on QQQ/GLD/IWM/SPY;
+evidence rows in `backtest_results.csv`):
 
-- **1Day** — plain RSI-50 cross, all filters off. Filters (band, MA200,
-  volume) all *reduced* returns on daily bars; the volume filter especially
-  is far too strict there.
-- **15Min** — band 55/45 + volume ×1.5 + MA200. Volume confirmation was the
-  single biggest intraday improvement.
-- **1Hour / 5Min / 1Min** — marked `not backtested` in the file; guesses
-  inherited from the 15Min findings. Run `backtest` on them before trusting.
+- **1Day** — band 55/40 + MA50. The asymmetric band beat the previous 60/40
+  profile out-of-sample (+20.7% vs +19.3% test avg). Daily bars remain by far
+  the strongest timeframe for this strategy.
+- **15Min** — profile keeps band 55/45 + volume ×1.5 + MA200. A leaner
+  candidate (55/45 + 1-hour MA20 trend confirmation, no volume/MA200) tripled
+  the training return with similar out-of-sample results and is being paper
+  traded (see `deploy/env/`).
+- **1Hour** — plain RSI setups overfit badly here (train +19.8% collapsed to
+  −0.6% out-of-sample); a daily-trend confirmation (1Day MA50) is what keeps
+  hourly variants positive. Profile entry still marked untested; the paper
+  candidate lives in `deploy/env/`.
+- **5Min / 1Min** — guesses, not backtested.
 
 When you re-tune, update `settings`, `tuned`, and `notes` in `profiles.json`
 so the evidence stays with the numbers.
@@ -101,6 +130,13 @@ Everything is set via environment variables (see `.env.example`):
 | `VOLUME_MULT` | `0` (off) | Only buy when signal-bar volume ≥ this × recent average |
 | `VOLUME_LOOKBACK` | `20` | Bars used for the average-volume baseline |
 | `TRAIL_PERCENT` | `0` (off) | Trailing stop % below high-water mark (server-side GTC) |
+| `HTF_MA_PERIOD` | `0` (off) | Higher-timeframe trend confirmation: only buy when the close is above this MA on `HTF_TIMEFRAME` bars (intraday timeframes only) |
+| `HTF_TIMEFRAME` | `1Hour` | Higher timeframe for that check: `1Hour`, `4Hour`, `1Day` |
+| `NOTIONAL` | `1000` | Dollars per new position |
+| `NOTIONAL_PCT` | `0` (off) | Size each entry as this % of current account equity instead (overrides `NOTIONAL`; capped by available cash so entries never use margin) |
+| `TRADES_DB` | `trades.db` | Trade journal location |
+| `POLL_SECONDS` | `60` | Loop-mode check interval |
+| `BACKTEST_DAYS` | `365` | History window for backtests |
 
 ### Trailing stops
 
@@ -113,19 +149,25 @@ that happen while the bot is away are journaled on the next pass. Note the
 tuner optimizes *return*, where stops rarely win — their real job is capping
 drawdown, so setting a wide one (e.g. 10-15%) manually as disaster insurance
 is reasonable even if the backtest says it costs a little return.
-| `NOTIONAL` | `1000` | Dollars per new position |
-| `POLL_SECONDS` | `60` | Loop-mode check interval |
-| `BACKTEST_DAYS` | `365` | History window for backtests |
 
 ## How it works
 
 1. Each pass, the bot checks the market clock and skips if closed.
 2. It fetches recent bars for each symbol, drops any still-forming bar, and
    computes RSI on the closes.
-3. If RSI crossed above the midline on the latest completed bar it buys
-   `NOTIONAL` dollars (market order); if it crossed below, it closes the
-   position. Repeat signals with an existing/empty position are ignored, so
-   restarts are safe.
+3. Buy signals then pass through whichever filters are enabled (volume,
+   trend MA, higher-timeframe trend); vetoes are logged with the reason.
+4. If a buy survives, it buys `NOTIONAL` dollars — or `NOTIONAL_PCT` of
+   current equity — as a market order; a sell-cross closes the position.
+   Repeat signals with an existing/empty position are ignored, so restarts
+   are safe.
+
+## Running unattended (cloud)
+
+`deploy/` contains a systemd-based deployment kit: one service per bot
+instance, each fully defined by an env file in `deploy/env/` (the committed
+`.example` files encode the three current paper-trading candidates). Works on
+any small Ubuntu VPS (~$6/month). See `deploy/README.md` for the runbook.
 
 ## Caveats
 

@@ -5,16 +5,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this is
 
 A long-only RSI-midline trading bot for Alpaca: buy when RSI crosses above a
-level, sell when it crosses below (with optional band, trend-MA, volume, and
-trailing-stop filters). Single module: `rsi_midline_bot.py`. Everything else
-is config (`profiles.json`, `.env`) or generated data (`trades.db`).
+level, sell when it crosses below (with optional band, trend-MA, volume,
+higher-timeframe-trend, and trailing-stop filters). Single module:
+`rsi_midline_bot.py`. Everything else is config (`profiles.json`, `.env`,
+`deploy/env/`) or generated data (`trades.db`, `backtest_results.csv` — the
+append-only experiment log every backtest writes to).
 
 ## Commands
 
 ```bash
 .venv/bin/python rsi_midline_bot.py run        # one signal pass (places paper orders!)
 .venv/bin/python rsi_midline_bot.py loop       # continuous; daily tf sleeps until 10 min before close
-.venv/bin/python rsi_midline_bot.py backtest   # compare strategy variants, read-only
+.venv/bin/python rsi_midline_bot.py backtest   # compare variants (never trades); appends to backtest_results.csv
 .venv/bin/python rsi_midline_bot.py tune       # grid search + walk-forward; may write profiles.json
 .venv/bin/python rsi_midline_bot.py tune --dry-run
 .venv/bin/python rsi_midline_bot.py trades 50  # show trade journal
@@ -24,8 +26,11 @@ is config (`profiles.json`, `.env`) or generated data (`trades.db`).
 - There is no test suite. Verification workflow: after touching `simulate()`,
   re-run `backtest` with unchanged settings and confirm the trail-off variant
   rows are **numerically identical** to before the change (this caught/validated
-  past refactors). Strategy-logic pieces (`rsi`, `crossover_signal`) can be
-  tested standalone with synthetic pandas Series — they don't need API keys.
+  past refactors). A second identity check: the `active settings` backtest row
+  must exactly match any hardcoded variant with the same parameters (e.g. the
+  15Min profile reproduces `Band + vol + MA200`). Strategy-logic pieces
+  (`rsi`, `crossover_signal`, `htf_trend_ok`) can be tested standalone with
+  synthetic pandas Series/DataFrames — they don't need API keys.
 - Override any setting per-invocation via env: `TIMEFRAME=15Min BACKTEST_DAYS=1095 .venv/bin/python rsi_midline_bot.py backtest`.
 - Fetching a year of 15Min bars takes ~1 min of silence; daily is seconds. Use generous timeouts.
 - Unattended cloud deployment (systemd, one service per bot instance): see
@@ -73,6 +78,12 @@ Don't bypass that gate; when editing profiles by hand, update the notes.
 - `eval_from`/`eval_to` restrict *scoring* to a bar range while indicators
   warm up on full history — this is how walk-forward splits avoid losing the
   MA200 warmup. Backtest/tune returns ignore slippage, commissions, dividends.
+- The HTF trend filter (`htf_trend_ok`) resamples the trading bars *up* to
+  `HTF_TIMEFRAME` and aligns so each trading bar only sees HTF bars that had
+  fully closed by the time the bar itself closed — preserve this no-look-ahead
+  alignment (HTF bars are indexed at their end time; ffill onto
+  `index + bar_len`). Disabled when trading `1Day`. Not in the tune grid;
+  test HTF candidates via `backtest` env overrides (`active settings` row).
 
 ## Live-trading invariants
 
@@ -84,9 +95,14 @@ Don't bypass that gate; when editing profiles by hand, update the notes.
   fractional shares), `exit()` cancels open orders before `close_position`,
   and `reconcile_stop_fills()` journals stop fills that happened while the
   bot was asleep (deduped by `order_id`).
-- Every order is journaled to SQLite (`trades.db`) with its signal context
-  (RSI, relative volume, active settings). rvol is recorded even when the
-  volume filter is off — intentional, for later analysis.
+- Sizing: `NOTIONAL_PCT` sizes each entry as a percent of *current* account
+  equity, capped at available cash so entries never lean on margin (falls
+  back to flat `NOTIONAL` when unset). The user's plan: paper accounts reset
+  to $2,000 with `NOTIONAL_PCT=25` to mimic the intended live account.
+- Every order is journaled to SQLite (`trades.db`, path via `TRADES_DB`) with
+  its signal context (RSI, relative volume, active settings incl. `htf_ma`).
+  rvol is recorded even when the volume filter is off — intentional, for
+  later analysis. Each deployed instance gets its own journal file.
 
 ## Data caveats (free Alpaca tier)
 
@@ -109,3 +125,18 @@ From backtests on QQQ/GLD/IWM/SPY (and earlier SPY/AAPL/MSFT), documented in
 - The strategy typically captures ~60-70% of a bull market and earns its keep
   by exiting downtrends (works on trending assets; whipsaws badly on choppy
   ones like XLE). Expect it to trail buy & hold in bull years.
+
+From the 2026-07-11 walk-forward profile search (70/30 split, QQQ/GLD/IWM/SPY,
+evidence in `backtest_results.csv`):
+
+- On 1Day, the asymmetric 55/40 band beat the tuned 60/40 out-of-sample
+  (+20.7% vs +19.3% test avg) — now the profile. MA0 scored identically OOS;
+  MA50 kept as downtrend insurance.
+- Plain RSI setups on 1Hour overfit badly (train +19.8% → test −0.6%); the
+  1Day-MA50 HTF confirmation is what keeps hourly variants positive OOS.
+- A 1Hour MA50 HTF filter on 15Min bars ≈ the MA200 trend filter (both look
+  back ~50 trading hours) — HTF only adds new information with shorter MAs
+  (e.g. MA20).
+- The three paper-trading candidates (one per timeframe) are encoded in
+  `deploy/env/*.env.example`, each on its own Alpaca paper account to avoid
+  position collisions.
