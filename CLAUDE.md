@@ -99,6 +99,11 @@ Don't bypass that gate; when editing profiles by hand, update the notes.
 
 - Signals are edge-triggered (cross, not level) and `enter`/`exit` skip when
   the position state already matches, so restarts and repeated passes are safe.
+- `run_once` must fetch enough history for **every** active filter's warmup —
+  the HTF filter especially (a 1Day MA50 needs ~90 calendar days of intraday
+  bars; an all-NaN MA silently vetoes every buy). This bug shipped once
+  (caught 2026-07-12 before the bot ever traded); when adding a filter, size
+  the warmup and log-verify the filter can actually pass on live data.
 - Trailing stops are **server-side GTC orders on Alpaca** — required because
   the daily loop sleeps ~23h between passes. Consequences baked into the code:
   whole-share entry sizing when `TRAIL_PERCENT` is set (stops can't hold
@@ -123,9 +128,8 @@ Don't bypass that gate; when editing profiles by hand, update the notes.
   (`BAR_ADJUSTMENT=all`; set `raw` to reproduce older baselines). Adjustment
   shifts results materially: dividends add 3-6 points to 3-yr ETF buy & hold,
   and ex-div gaps previously created/removed whole RSI-cross trades on
-  QQQ/SPY. Note the droplet still runs pre-adjustment code — shipping this
-  will slightly change live signals; do it between paper-test cohorts, not
-  mid-test.
+  QQQ/SPY. Shipped to the droplet 2026-07-12, before the paper-test cohort's
+  first trade.
 
 ## Established strategy findings (don't re-derive)
 

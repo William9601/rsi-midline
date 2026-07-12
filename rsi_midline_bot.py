@@ -479,13 +479,30 @@ class RsiMidlineBot:
             days = max(200, int((self.cfg.trend_ma + self.cfg.rsi_period) * 1.6) + 30)
         else:
             days = 60 if self.cfg.trend_ma else 30
+            if self.cfg.htf_ma:
+                # The HTF filter needs htf_ma *higher-timeframe* bars or its
+                # rolling MA is all-NaN and every buy gets vetoed (a 1Day MA50
+                # needs ~50 trading days — far more than the base 30 calendar).
+                htf_hours = {"1Hour": 1, "4Hour": 4, "1Day": 6.5}[self.cfg.htf_timeframe]
+                htf_trading_days = self.cfg.htf_ma * htf_hours / 6.5
+                days = max(days, int(htf_trading_days * 1.6) + 10)
         bars = self.fetch_bars(self.cfg.symbols, days=days)
         for symbol in self.cfg.symbols:
             symbol = symbol.strip().upper()
+            try:
+                self._eval_symbol(symbol, bars)
+            except Exception:
+                # One symbol's failure (rejected order, API hiccup) must not
+                # cost the remaining symbols their pass — on the daily
+                # timeframe that would forfeit the whole trading day.
+                log.exception("%s: pass failed; continuing with next symbol",
+                              symbol)
+
+    def _eval_symbol(self, symbol: str, bars: pd.DataFrame) -> None:
             df = self.closed_bars(symbol, bars)
             if df is None or len(df) < self.cfg.rsi_period + 2:
                 log.warning("%s: not enough data, skipping", symbol)
-                continue
+                return
             closes = df["close"]
             r = rsi(closes, self.cfg.rsi_period)
             # Volume on the latest bar vs the average of the bars before it,
@@ -505,7 +522,10 @@ class RsiMidlineBot:
                     log.info("%s: buy signal vetoed by trend filter (price %.2f <= MA%d %.2f)",
                              symbol, closes.iloc[-1], self.cfg.trend_ma, ma)
                     signal = None
-            if signal == "buy" and self.cfg.htf_ma:
+            # HTF confirmation only applies when resampling *up* from an
+            # intraday timeframe — same gate the backtest applies.
+            if (signal == "buy" and self.cfg.htf_ma
+                    and self.timeframe.unit != TimeFrameUnit.Day):
                 htf_up = htf_trend_ok(df, HTF_RULES[self.cfg.htf_timeframe],
                                       self.cfg.htf_ma, self.bar_len()).iloc[-1]
                 if not htf_up:
