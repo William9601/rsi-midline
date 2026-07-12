@@ -11,6 +11,9 @@ Usage:
     python rsi_midline_bot.py run        # evaluate signals once and trade
     python rsi_midline_bot.py loop       # run continuously on an interval
     python rsi_midline_bot.py backtest   # backtest the strategy on history
+    python rsi_midline_bot.py portfolio  # backtest all symbols on ONE shared
+                                         # account with live sizing (equity
+                                         # curve, max drawdown, exposure)
     python rsi_midline_bot.py tune       # grid-search + walk-forward validate,
                                          # updating profiles.json if the winner
                                          # holds up out-of-sample (--dry-run to
@@ -36,6 +39,7 @@ from datetime import datetime, timedelta, timezone
 
 import numpy as np
 import pandas as pd
+from alpaca.data.enums import Adjustment
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
@@ -153,6 +157,19 @@ class Config:
     poll_seconds: int = field(default_factory=lambda: int(os.environ.get("POLL_SECONDS", "60")))
     # Days of history to backtest.
     backtest_days: int = field(default_factory=lambda: int(os.environ.get("BACKTEST_DAYS", "365")))
+    # Simulator friction, in basis points of trade value charged on each side
+    # (entry and exit). 0 = frictionless, which reproduces legacy backtest
+    # numbers exactly. Live trading ignores this (fills are what they are).
+    cost_bps: float = field(default_factory=lambda: float(os.environ.get("COST_BPS", "0")))
+    # Alpaca bar adjustment: raw | split | dividend | all. 'all' removes
+    # split/dividend gaps that would otherwise feed the RSI as fake moves.
+    # Use 'raw' to reproduce backtests recorded before this setting existed.
+    bar_adjustment: str = field(
+        default_factory=lambda: os.environ.get("BAR_ADJUSTMENT", "all"))
+    # Starting cash for the `portfolio` simulator (mirrors the planned live
+    # account; not used by live trading, which reads real account equity).
+    start_equity: float = field(
+        default_factory=lambda: float(os.environ.get("START_EQUITY", "2000")))
 
 
 # ---------------------------------------------------------------------------
@@ -278,6 +295,9 @@ class RsiMidlineBot:
             raise ValueError(f"TIMEFRAME must be one of {list(TIMEFRAMES)}")
         if cfg.htf_ma and cfg.htf_timeframe not in HTF_RULES:
             raise ValueError(f"HTF_TIMEFRAME must be one of {list(HTF_RULES)}")
+        if cfg.bar_adjustment not in [a.value for a in Adjustment]:
+            raise ValueError(
+                f"BAR_ADJUSTMENT must be one of {[a.value for a in Adjustment]}")
         self.timeframe = TIMEFRAMES[cfg.timeframe]
         db_path = os.environ.get("TRADES_DB") or os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "trades.db")
@@ -290,6 +310,7 @@ class RsiMidlineBot:
             symbol_or_symbols=symbols,
             timeframe=self.timeframe,
             start=datetime.now(timezone.utc) - timedelta(days=days),
+            adjustment=Adjustment(self.cfg.bar_adjustment),
         )
         return self.data.get_stock_bars(req).df
 
@@ -531,6 +552,125 @@ class RsiMidlineBot:
 
     # -- backtest -------------------------------------------------------------
 
+    def entry_exit_signals(
+        self,
+        df: pd.DataFrame,
+        buy_level: float,
+        sell_level: float,
+        ma_period: int,
+        vol_mult: float = 0,
+        htf_ma: int = 0,
+    ) -> tuple[pd.Series, pd.Series]:
+        """Boolean (cross_up, cross_down) Series for one symbol, entry filters
+        applied. Single source of signal truth for both simulators."""
+        closes = df["close"]
+        r = rsi(closes, self.cfg.rsi_period)
+        cross_up = (r > buy_level) & (r.shift(1) <= buy_level)
+        cross_down = (r < sell_level) & (r.shift(1) >= sell_level)
+        if ma_period:
+            cross_up &= closes > closes.rolling(ma_period).mean()
+        if vol_mult:
+            avg_vol = df["volume"].shift(1).rolling(self.cfg.vol_lookback).mean()
+            cross_up &= df["volume"] >= avg_vol * vol_mult
+        if htf_ma:
+            cross_up &= htf_trend_ok(df, HTF_RULES[self.cfg.htf_timeframe],
+                                     htf_ma, self.bar_len())
+        return cross_up, cross_down
+
+    def simulate_portfolio(
+        self,
+        dfs: dict[str, pd.DataFrame],
+        buy_level: float,
+        sell_level: float,
+        ma_period: int,
+        vol_mult: float = 0,
+        trail_pct: float = 0,
+        htf_ma: int = 0,
+    ) -> dict:
+        """Simulate every symbol on ONE shared account, sized like live trading.
+
+        Entries take min(NOTIONAL_PCT% of current equity, available cash) —
+        the same sizing `enter()` uses (flat NOTIONAL fallback when the pct is
+        0) — so unlike `simulate()`, which puts 100% into each symbol
+        independently, this reports the equity curve of the deployed
+        portfolio: shared cash, compounding, and entries skipped when cash ran
+        out. Exits are processed before entries on each bar; fills at bar
+        close with COST_BPS friction per side; fractional shares (live sizing
+        is whole-share only when a trailing stop is on).
+        """
+        cfg = self.cfg
+        c = cfg.cost_bps / 10000
+        closes = pd.DataFrame(
+            {s: df["close"] for s, df in dfs.items()}).sort_index()
+        syms = list(closes.columns)
+        sig = {s: self.entry_exit_signals(dfs[s], buy_level, sell_level,
+                                          ma_period, vol_mult, htf_ma)
+               for s in syms}
+        idx = closes.index
+        ups = np.column_stack(
+            [sig[s][0].reindex(idx, fill_value=False).to_numpy() for s in syms])
+        downs = np.column_stack(
+            [sig[s][1].reindex(idx, fill_value=False).to_numpy() for s in syms])
+        has_bar = closes.notna().to_numpy()
+        px = closes.ffill().to_numpy()  # last known price, for marking equity
+
+        nsym = len(syms)
+        qty = np.zeros(nsym)
+        entry_px = np.zeros(nsym)  # cost basis incl. entry friction
+        hwm = np.zeros(nsym)
+        cash = cfg.start_equity
+        equity_curve = np.empty(len(idx))
+        invested_frac = np.empty(len(idx))
+        trade_returns: list[float] = []
+        trades_per_sym = {s: 0 for s in syms}
+        for i in range(len(idx)):
+            exited = np.zeros(nsym, dtype=bool)
+            # Exits first: same-bar sales free cash for entries elsewhere.
+            for j in range(nsym):
+                if qty[j] and has_bar[i, j]:
+                    p = px[i, j]
+                    hwm[j] = max(hwm[j], p)
+                    if downs[i, j] or (
+                            trail_pct and p <= hwm[j] * (1 - trail_pct / 100)):
+                        cash += qty[j] * p * (1 - c)
+                        trade_returns.append(p * (1 - c) / entry_px[j] - 1)
+                        trades_per_sym[syms[j]] += 1
+                        qty[j] = 0.0
+                        exited[j] = True
+            equity = cash + float(np.nansum(qty * px[i]))
+            for j in range(nsym):
+                # A symbol that exited this bar can't re-enter on the same bar
+                # (mirrors simulate(); live can't either — one pass per bar).
+                if qty[j] or not ups[i, j] or exited[j] or cash <= 1e-9:
+                    continue
+                notional = (min(equity * cfg.notional_pct / 100, cash)
+                            if cfg.notional_pct else min(cfg.notional, cash))
+                p = px[i, j]
+                qty[j] = notional / (p * (1 + c))
+                entry_px[j] = p * (1 + c)
+                hwm[j] = p
+                cash -= notional
+            pos_val = float(np.nansum(qty * px[i]))
+            equity_curve[i] = cash + pos_val
+            invested_frac[i] = pos_val / equity_curve[i]
+
+        eq = pd.Series(equity_curve, index=idx)
+        span_days = max((idx[-1] - idx[0]).days, 1)
+        wins = sum(1 for r in trade_returns if r > 0)
+        return {
+            "equity": eq,
+            "final_equity": float(eq.iloc[-1]),
+            "return_pct": (float(eq.iloc[-1]) / cfg.start_equity - 1) * 100,
+            "cagr_pct": ((float(eq.iloc[-1]) / cfg.start_equity)
+                         ** (365.25 / span_days) - 1) * 100,
+            "max_dd_pct": float((eq / eq.cummax() - 1).min() * 100),
+            "exposure_pct": float(np.mean(invested_frac) * 100),
+            "trades": len(trade_returns),
+            "win_rate": (wins / len(trade_returns) * 100) if trade_returns else 0.0,
+            "trades_per_sym": trades_per_sym,
+            "open_positions": [syms[j] for j in range(nsym) if qty[j]],
+        }
+
     def simulate(
         self,
         df: pd.DataFrame,
@@ -550,19 +690,12 @@ class RsiMidlineBot:
         below the trade's high-water mark (signals act on the next bar).
         eval_from/eval_to restrict *scoring* to a bar range while indicators
         still warm up on the full history (used for walk-forward splits).
+        COST_BPS friction is charged per trade round trip; a trade left open
+        at the window edge is charged the full round trip anyway.
         """
         closes = df["close"]
-        r = rsi(closes, self.cfg.rsi_period)
-        cross_up = (r > buy_level) & (r.shift(1) <= buy_level)
-        cross_down = (r < sell_level) & (r.shift(1) >= sell_level)
-        if ma_period:
-            cross_up &= closes > closes.rolling(ma_period).mean()
-        if vol_mult:
-            avg_vol = df["volume"].shift(1).rolling(self.cfg.vol_lookback).mean()
-            cross_up &= df["volume"] >= avg_vol * vol_mult
-        if htf_ma:
-            cross_up &= htf_trend_ok(df, HTF_RULES[self.cfg.htf_timeframe],
-                                     htf_ma, self.bar_len())
+        cross_up, cross_down = self.entry_exit_signals(
+            df, buy_level, sell_level, ma_period, vol_mult, htf_ma)
         # The trailing stop is path-dependent (high-water mark), so walk the
         # bars to build the in-market series.
         c = closes.to_numpy()
@@ -583,12 +716,18 @@ class RsiMidlineBot:
         if eval_from or eval_to is not None:
             in_market = in_market.iloc[eval_from:eval_to]
             bar_returns = bar_returns.iloc[eval_from:eval_to]
-        total = ((1 + bar_returns * in_market).prod() - 1) * 100
         # Group consecutive in-market bars into trades for the win rate.
         grp = (in_market != in_market.shift()).cumsum()
         trade_returns = (1 + bar_returns[in_market]).groupby(grp[in_market]).prod() - 1
         trades = len(trade_returns)
+        # Friction: buy at close*(1+c), sell at close*(1-c) — one round-trip
+        # factor per trade. c=0 gives cost_f=1.0 and reproduces the
+        # frictionless legacy numbers bit-for-bit.
+        c = self.cfg.cost_bps / 10000
+        cost_f = (1 - c) / (1 + c) if c else 1.0
+        trade_returns = (1 + trade_returns) * cost_f - 1
         win_rate = float((trade_returns > 0).mean() * 100) if trades else 0.0
+        total = ((1 + bar_returns * in_market).prod() * cost_f ** trades - 1) * 100
         return trades, win_rate, total
 
     def backtest(self) -> None:
@@ -669,7 +808,85 @@ class RsiMidlineBot:
                     "return_pct": round(total, 2), "buyhold_pct": round(hold, 2),
                 })
         self._log_backtest_results(results)
-        print("\nNote: backtest ignores slippage, commissions, and fills at next-bar close.\n")
+        print(f"\nNote: fills at signal-bar close; friction COST_BPS="
+              f"{self.cfg.cost_bps:g} bps/side; bars adjustment="
+              f"'{self.cfg.bar_adjustment}'. Each symbol simulated in "
+              f"isolation, 100% invested — see `portfolio` for shared-account "
+              f"sizing.\n")
+
+    def portfolio(self) -> None:
+        """Backtest the resolved config as one shared account (live sizing)."""
+        cfg = self.cfg
+        log.info(
+            "Fetching %d days of %s bars for %s — this can take a minute...",
+            cfg.backtest_days, cfg.timeframe, ",".join(cfg.symbols),
+        )
+        bars = self.fetch_bars(cfg.symbols, days=cfg.backtest_days)
+        dfs: dict[str, pd.DataFrame] = {}
+        for symbol in cfg.symbols:
+            symbol = symbol.strip().upper()
+            try:
+                dfs[symbol] = bars.xs(symbol, level="symbol")
+            except KeyError:
+                print(f"{symbol}: no data, excluded")
+        if not dfs:
+            sys.exit("No data for any symbol")
+        htf_ok = self.timeframe.unit != TimeFrameUnit.Day
+        res = self.simulate_portfolio(
+            dfs, cfg.rsi_buy, cfg.rsi_sell, cfg.trend_ma, cfg.vol_mult,
+            cfg.trail_percent, cfg.htf_ma if htf_ok else 0)
+
+        # Benchmark: equal-weight buy & hold from the first bar where every
+        # symbol trades, entry friction charged, marked to market at the end.
+        c = cfg.cost_bps / 10000
+        closes = pd.DataFrame(
+            {s: df["close"] for s, df in dfs.items()}).sort_index().ffill().dropna()
+        shares = (cfg.start_equity / len(closes.columns)) / (closes.iloc[0] * (1 + c))
+        bh = (closes * shares).sum(axis=1)
+        bh_ret = (bh.iloc[-1] / cfg.start_equity - 1) * 100
+        bh_dd = float((bh / bh.cummax() - 1).min() * 100)
+
+        sizing = (f"{cfg.notional_pct:g}% of equity"
+                  if cfg.notional_pct else f"flat ${cfg.notional:g}")
+        print(f"\nPortfolio backtest: {cfg.timeframe}, last {cfg.backtest_days} "
+              f"days, {', '.join(dfs)}\nstart ${cfg.start_equity:g}, entries "
+              f"{sizing} (cash-capped), COST_BPS={cfg.cost_bps:g}/side, "
+              f"adjustment='{cfg.bar_adjustment}'")
+        print(f"band {cfg.rsi_buy:g}/{cfg.rsi_sell:g}, MA {cfg.trend_ma}, "
+              f"vol x{cfg.vol_mult:g}, trail {cfg.trail_percent:g}%"
+              + (f", {cfg.htf_timeframe} MA{cfg.htf_ma}"
+                 if htf_ok and cfg.htf_ma else ""))
+        print(f"\n  {'':<14}{'return':>9}{'CAGR':>8}{'max DD':>8}")
+        print(f"  {'strategy':<14}{res['return_pct']:>+8.1f}%"
+              f"{res['cagr_pct']:>+7.1f}%{res['max_dd_pct']:>7.1f}%")
+        print(f"  {'buy & hold':<14}{bh_ret:>+8.1f}%"
+              f"{((bh.iloc[-1] / cfg.start_equity) ** (365.25 / max((bh.index[-1] - bh.index[0]).days, 1)) - 1) * 100:>+7.1f}%"
+              f"{bh_dd:>7.1f}%")
+        per_sym = ", ".join(f"{s} {n}" for s, n in res["trades_per_sym"].items())
+        print(f"\n  final equity ${res['final_equity']:,.0f}, avg exposure "
+              f"{res['exposure_pct']:.0f}%, {res['trades']} closed trades "
+              f"(win rate {res['win_rate']:.1f}%): {per_sym}")
+        if res["open_positions"]:
+            print(f"  still open at window end (marked to market): "
+                  f"{', '.join(res['open_positions'])}")
+        run_ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        self._log_backtest_results([{
+            "run_ts": run_ts, "timeframe": cfg.timeframe,
+            "days": cfg.backtest_days, "rsi_period": cfg.rsi_period,
+            "symbol": "PORTFOLIO",
+            "variant": f"portfolio {sizing}, {cfg.cost_bps:g}bps",
+            "rsi_buy": cfg.rsi_buy, "rsi_sell": cfg.rsi_sell,
+            "trend_ma": cfg.trend_ma, "vol_mult": cfg.vol_mult,
+            "trail_pct": cfg.trail_percent,
+            "htf_ma": cfg.htf_ma if htf_ok else 0,
+            "htf_timeframe": cfg.htf_timeframe if htf_ok and cfg.htf_ma else "",
+            "trades": res["trades"], "win_rate": round(res["win_rate"], 2),
+            "return_pct": round(res["return_pct"], 2),
+            "buyhold_pct": round(bh_ret, 2),
+        }])
+        print(f"  (max drawdown strategy {res['max_dd_pct']:.1f}% vs buy & "
+              f"hold {bh_dd:.1f}% — the number the per-symbol backtest "
+              f"can't see)\n")
 
     def _log_backtest_results(self, rows: list[dict]) -> None:
         """Append every variant result to backtest_results.csv for comparison
@@ -861,7 +1078,7 @@ class RsiMidlineBot:
 
 def main() -> None:
     mode = sys.argv[1] if len(sys.argv) > 1 else "run"
-    if mode not in ("run", "loop", "backtest", "tune", "trades"):
+    if mode not in ("run", "loop", "backtest", "portfolio", "tune", "trades"):
         print(__doc__)
         sys.exit(1)
     load_dotenv()
@@ -885,6 +1102,8 @@ def main() -> None:
     elif mode == "trades":
         limit = int(sys.argv[2]) if len(sys.argv) > 2 else 20
         bot.show_trades(limit)
+    elif mode == "portfolio":
+        bot.portfolio()
     else:
         bot.backtest()
 

@@ -17,6 +17,8 @@ append-only experiment log every backtest writes to).
 .venv/bin/python rsi_midline_bot.py run        # one signal pass (places paper orders!)
 .venv/bin/python rsi_midline_bot.py loop       # continuous; daily tf sleeps until 10 min before close
 .venv/bin/python rsi_midline_bot.py backtest   # compare variants (never trades); appends to backtest_results.csv
+.venv/bin/python rsi_midline_bot.py portfolio  # backtest all symbols on ONE shared account with live sizing
+                                               # (equity curve, max DD, exposure); e.g. NOTIONAL_PCT=25 COST_BPS=5
 .venv/bin/python rsi_midline_bot.py tune       # grid search + walk-forward; may write profiles.json
 .venv/bin/python rsi_midline_bot.py tune --dry-run
 .venv/bin/python rsi_midline_bot.py trades 50  # show trade journal
@@ -26,7 +28,8 @@ append-only experiment log every backtest writes to).
 - There is no test suite. Verification workflow: after touching `simulate()`,
   re-run `backtest` with unchanged settings and confirm the trail-off variant
   rows are **numerically identical** to before the change (this caught/validated
-  past refactors). A second identity check: the `active settings` backtest row
+  past refactors). Baselines recorded before 2026-07-12 used raw bars and no
+  friction: reproduce them with `BAR_ADJUSTMENT=raw COST_BPS=0`. A second identity check: the `active settings` backtest row
   must exactly match any hardcoded variant with the same parameters (e.g. the
   15Min profile reproduces `Band + vol + MA200`). Strategy-logic pieces
   (`rsi`, `crossover_signal`, `htf_trend_ok`) can be tested standalone with
@@ -77,7 +80,14 @@ Don't bypass that gate; when editing profiles by hand, update the notes.
   trailing stop is path-dependent on the trade's high-water mark.
 - `eval_from`/`eval_to` restrict *scoring* to a bar range while indicators
   warm up on full history — this is how walk-forward splits avoid losing the
-  MA200 warmup. Backtest/tune returns ignore slippage, commissions, dividends.
+  MA200 warmup. Friction is `COST_BPS` per side (default 0 = frictionless;
+  a trade spanning a window edge is charged the full round trip).
+- `simulate()` puts 100% into each symbol independently;
+  `simulate_portfolio()` runs all symbols on one shared account with live
+  sizing (`NOTIONAL_PCT` of current equity, cash-capped, exits before entries
+  each bar, fractional shares) and reports equity curve, max drawdown, and
+  exposure. Both consume `entry_exit_signals()` — the single source of signal
+  truth; keep it that way.
 - The HTF trend filter (`htf_trend_ok`) resamples the trading bars *up* to
   `HTF_TIMEFRAME` and aligns so each trading bar only sees HTF bars that had
   fully closed by the time the bar itself closed — preserve this no-look-ahead
@@ -109,8 +119,13 @@ Don't bypass that gate; when editing profiles by hand, update the notes.
 - Historical bars come from the IEX feed: prices are near-consolidated but
   **volumes are a small unreliable slice** — treat volume-filter backtests
   with suspicion.
-- Bars are raw/unadjusted (no `adjustment` param passed). Fine for the current
-  ETF basket; a latent landmine if individual stocks that split are added.
+- Bars are split/dividend-adjusted by default since 2026-07-12
+  (`BAR_ADJUSTMENT=all`; set `raw` to reproduce older baselines). Adjustment
+  shifts results materially: dividends add 3-6 points to 3-yr ETF buy & hold,
+  and ex-div gaps previously created/removed whole RSI-cross trades on
+  QQQ/SPY. Note the droplet still runs pre-adjustment code — shipping this
+  will slightly change live signals; do it between paper-test cohorts, not
+  mid-test.
 
 ## Established strategy findings (don't re-derive)
 
