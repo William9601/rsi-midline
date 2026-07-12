@@ -175,6 +175,53 @@ frictionless, `EXP *` rows in `backtest_results.csv`):
   **worse everywhere**, full-window and out-of-sample, alone or stacked on
   the HTF MA — it lags price and re-allows entries late. Rejected; the knob
   exists but stays 0.
+- Midline-rejection entries (buy the RSI hook-up from a 40–50 pullback
+  instead of / in addition to the cross above 55; tested via a scratch
+  subclass overriding `entry_exit_signals`, 1Day 1095d, exits unchanged):
+  as a **replacement** it roughly halves returns (avg +29% vs +68%
+  full-window, +14% vs +22% OOS) — rejection-only entries sit out V-shaped
+  recoveries where RSI regains 50+ without ever pulling back into the zone,
+  and this strategy's edge is being aboard those legs. As an **addition**
+  (cross OR hook) it's a wash (OOS avg +22.6% vs +22.4%). Rejected;
+  `EXP hook`/`EXP cross|hook` rows in `backtest_results.csv`.
+- Dynamic exits (1Day 1095d, deployed entries, custom simulator validated
+  bit-for-bit against `simulate()` on the plain and trail-8% exits):
+  Chandelier ATR trails lose to the plain RSI-cross-below-40 exit — 2xATR
+  whipsaws (9→23 trades/symbol, avg +37% vs +68% full, +14% vs +22% OOS,
+  and *worse* max DD on QQQ/SPY); 3xATR is milder but still worse (+45%
+  full / +17% OOS). With any ATR trail on, the RSI exit almost never fires
+  first, so it's effectively a replacement, and friction makes the extra
+  churn worse. Selling 50% at RSI>=70 cuts avg max DD −12.8%→−9.2% but
+  costs a third of full-window return and ~36% of OOS (+14.3% vs +22.4%)
+  — RSI>70 is where the trend edge lives; even return/DD doesn't improve.
+  Rejected; `EXP exit`/`EXP ATR`/`EXP part50` rows in `backtest_results.csv`.
+- 630-combo sweep (RSI period 10/14/21 x buy 50-60 x sell 30-45 x MA
+  0/20/50/100 sma/ema, 1Day 1095d + 2555d validation, 70/30 walk-forward;
+  `EXP swp`/`EXP swp7y` rows): the deployed sell-40 exit is too shallow —
+  **sell 30-35 beats sell 40 across nearly every period/band/MA and every
+  symbol, on both windows, in both the 3y and 7y tests** (7y test avg:
+  deployed +45.0% vs +58.7% for p14 55/30 ema50, +56.9% for 55/35 noMA,
+  +55.1% for p21 52/35 sma50; test-min improves too). It's a plateau, not
+  a spike, so unlikely to be overfit. Caveats: RSI-21 deep-sell variants
+  drop to 3-8 trades/7y/symbol (basically buy & hold + crash filter; in the
+  1095d OOS window they were long throughout, so that window can't rank
+  them); all variants still trail 7y buy & hold. Candidate change:
+  RSI_SELL_LEVEL 40 -> 35 (or 30) on the 1Day profile — not applied, and
+  the `tune` grid (GRID_BANDS, fixed rsi_period=14) cannot see these combos.
+- Intraday sweeps (same grid philosophy + HTF dimension, 365d, 70/30,
+  frictionless with a COST_BPS=5 shortlist pass; `EXP swp1h`/`EXP swp15m`
+  rows): **deep sell (30-35) is confirmed on all three timeframes.**
+  1Hour: deployed bot#3 (p14 60/40 + 1D-MA50) is weak (train +1.0%, test
+  +4.1%, train goes negative with friction); **p21 60/40 plain** (RSI-21,
+  no filters) beats it on both windows and survives friction (train
+  +9.2%/+7.3%, test +8.8%/+8.0%, 102 trades vs 118) — RSI-21's smoothing
+  appears to do the HTF filter's whipsaw-suppression job; p14 50/30 has
+  the best test (+12.2%/+11.2% with friction, test-min +0.5%) but mediocre
+  train. 15Min: friction kills everything — deployed bot#2 (p14 55/45 +
+  1h-MA20) backtests **negative at COST_BPS=5** (train -2.3%, test -1.4%,
+  770 trades/yr) and no combo fixes it (best survivors are low-churn
+  sell-30 variants at ~+4.5% test with flat train). 15Min is
+  friction-bound; the paper test will measure real fills.
 - Trend-MA type (`MA_TYPE`: sma/ema/hma) on 1Day 55/40 over 1095d: HMA50 and
   EMA50 beat-or-match the deployed SMA50 on every symbol full-window (avg
   +76.7% / +74.5% vs +67.7%; unfiltered +68.7%). All differences sit in the
