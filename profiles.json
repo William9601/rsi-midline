@@ -13,14 +13,14 @@
     }
   },
   "1Hour": {
-    "tuned": "2026-07-10",
-    "status": "not backtested - inherited from 15Min findings",
-    "notes": "Untested guess: intraday chop should make band + volume + trend filters help here as they did on 15Min. Run 'backtest' with TIMEFRAME=1Hour before trusting. MA200 = 200 hourly bars (~6 weeks).",
+    "tuned": "2026-07-13",
+    "status": "backtested (RTH-rules walk-forward, 365d)",
+    "notes": "p14 55/45 plain (no MA, no volume, no HTF) from the 2026-07-13 RTH_ONLY re-sweep, 432 combos, 70/30 walk-forward ranked on train, COST_BPS=5: train +8.9%, test +4.5%, test-min +4.1% — positive on every symbol in both windows, ~44 trades/yr, on a plateau (p10 50/45, p10 55/40, p10 55/45 v1.5 also positive both windows). Evidence: 'EXP swpRTH1h' rows in backtest_results.csv. Replaced the untested filter guess; the 2026-07-12 all-hours pick (p21 60/40) did not survive the RTH correction (rank 218/432, train c5 +0.9%).",
     "settings": {
       "RSI_BUY_LEVEL": "55",
       "RSI_SELL_LEVEL": "45",
-      "TREND_MA_PERIOD": "200",
-      "VOLUME_MULT": "1.5",
+      "TREND_MA_PERIOD": "0",
+      "VOLUME_MULT": "0",
       "VOLUME_LOOKBACK": "20",
       "POLL_SECONDS": "1800"
     }

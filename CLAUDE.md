@@ -31,7 +31,9 @@ append-only experiment log every backtest writes to).
   re-run `backtest` with unchanged settings and confirm the trail-off variant
   rows are **numerically identical** to before the change (this caught/validated
   past refactors). Baselines recorded before 2026-07-12 used raw bars and no
-  friction: reproduce them with `BAR_ADJUSTMENT=raw COST_BPS=0`. A second identity check: the `active settings` backtest row
+  friction: reproduce them with `BAR_ADJUSTMENT=raw COST_BPS=0`; intraday
+  baselines recorded before 2026-07-13 also traded extended-hours bars — add
+  `RTH_ONLY=false`. A second identity check: the `active settings` backtest row
   must exactly match any hardcoded variant with the same parameters (e.g. the
   15Min profile reproduces `Band + vol + MA200`). Strategy-logic pieces
   (`rsi`, `crossover_signal`, `htf_trend_ok`) can be tested standalone with
@@ -90,6 +92,15 @@ Don't bypass that gate; when editing profiles by hand, update the notes.
   each bar, fractional shares) and reports equity curve, max drawdown, and
   exposure. Both consume `entry_exit_signals()` — the single source of signal
   truth; keep it that way.
+- `RTH_ONLY` (default true): intraday simulations act only on bars whose
+  close falls inside regular NY hours (9:30–16:00 ET, fixed — half-day early
+  closes are ignored). IEX bars span 4am–8pm ET, but live `run_once` skips
+  closed markets and signals are edge-triggered on the latest bar, so an
+  off-hours cross is **missed live, not delayed** — before this mask ~half of
+  intraday backtest trades happened at times live could never act
+  (2026-07-13 finding). Indicators still warm up on every bar, matching live.
+  Masked in `entry_exit_signals`, so both simulators and `tune` inherit it;
+  a bar ending exactly at 16:00 is not actionable (completes at the bell).
 - The HTF trend filter (`htf_trend_ok`) resamples the trading bars *up* to
   `HTF_TIMEFRAME` and aligns so each trading bar only sees HTF bars that had
   fully closed by the time the bar itself closed — preserve this no-look-ahead
@@ -130,7 +141,9 @@ Don't bypass that gate; when editing profiles by hand, update the notes.
 
 - Historical bars come from the IEX feed: prices are near-consolidated but
   **volumes are a small unreliable slice** — treat volume-filter backtests
-  with suspicion.
+  with suspicion. Intraday bars cover the extended 4am–8pm ET session;
+  pre-market bars are thin (a 15Min "close" can be one odd-lot print). See
+  `RTH_ONLY` above for how the simulators handle this.
 - Bars are split/dividend-adjusted by default since 2026-07-12
   (`BAR_ADJUSTMENT=all`; set `raw` to reproduce older baselines). Adjustment
   shifts results materially: dividends add 3-6 points to 3-yr ETF buy & hold,
@@ -222,6 +235,66 @@ frictionless, `EXP *` rows in `backtest_results.csv`):
   770 trades/yr) and no combo fixes it (best survivors are low-churn
   sell-30 variants at ~+4.5% test with flat train). 15Min is
   friction-bound; the paper test will measure real fills.
+- Extended-hours audit (2026-07-13, time-of-day trade reconstruction on the
+  deployed intraday variants): before `RTH_ONLY`, ~half of intraday backtest
+  trades executed outside 9:30–16:00 ET where live never acts — **every
+  intraday backtest and sweep recorded before 2026-07-13 (incl. `EXP swp15m`/
+  `EXP swp1h`) overstates trade count ~2x and describes a different system**;
+  conclusions survived a live-faithful re-check (15Min deployed rules,
+  frictionless: QQQ +5.9→+5.0%, GLD +34.9→+23.2%, IWM +18.9→+15.8%, SPY
+  +5.4→+10.3%, trades roughly halved) but re-derive any intraday number
+  before relying on it. Same audit: losing trades overwhelmingly get
+  *realized* at session opens (overnight gap-downs exiting on the first
+  bars — on 15Min the 4am and 9:30–10:30 exit buckets held ~74% of
+  cumulative losses; the 4am "fills" were thin pre-market prints live could
+  never get). Entry-time-of-day patterns were noise by comparison; first-30min
+  15Min entries ≈ breakeven pre-cost. 1Min loses even frictionless
+  (−17%/90d, 2486 trades). Untested candidate: exit-before-close variant to
+  kill overnight gap risk (would also give up overnight drift).
+- RTH re-sweep (2026-07-13, `EXP swpRTH15m`/`EXP swpRTH1h` rows: 432 combos
+  per timeframe, 365d, 70/30 walk-forward ranked on train only, friction
+  applied analytically at 5bps): under live-faithful RTH rules friction no
+  longer kills everything intraday (265/432 15Min combos positive on both
+  windows at c5 — the all-hours sim had doubled the friction bill). But
+  15Min train→test decay is severe (best train ~+16% → test +1-3% avg):
+  treat any 15Min "edge" as noise. Deployed 15Min bot#2 ranks 197/432
+  (test c5 −3.0%). **The deployed 1Hour p21 60/40 (bot#3) was picked on
+  all-hours evidence that did not survive the correction**: under RTH rules
+  it ranks 218/432 with train c5 +0.9% (test +5.2%, test-min −7.6%). Most
+  robust 1Hour region now: **p14 55/45 plain** (train +8.9, test +4.5,
+  test-min +4.1 — positive on every symbol in both windows, 44 trades/yr)
+  sitting on a plateau (p10 50/45, p10 55/40, p10 55/45 v1.5 also positive
+  both windows). **Applied 2026-07-13**: bot#3 swapped to p14 55/45 plain
+  (droplet env + example + 1Hour profile) before its first trade. 1Day
+  numbers are untouched by RTH and remain the best timeframe.
+- Structural tests (2026-07-13, `EXP struct15m`/`struct5m`/`struct5m2y`
+  rows; 730d fetch so year-1 = 2024-07→2025-07 was never used by any
+  selection decision; COST_BPS=5 analytic, RTH rules): **the RTH-sweep
+  15Min winners collapse on the fresh year** (p10 60/35 MA50: +19.3%
+  familiar year → −10.5% fresh; p14 60/40 MA50 likewise) — overfit
+  confirmed by data. Only the low-churn deep-sell family stays positive on
+  both years on 15Min (p21 50/35: +4.6/+17.3; p14 50/30 v1.5: +5.2/+13.1)
+  but that ≈ buy & hold with worse per-symbol risk. The same family on
+  5Min looked strong on the familiar year (+8/+11.5 with friction) and
+  deflated on the fresh one (+1.8/−2.7 avg, worst symbol −17.6%).
+  **Exit-before-close is a disaster everywhere** (−5% to −26%, both years,
+  both timeframes, every config): overnight drift is this strategy's profit
+  engine and gap risk is the cost of it — do not engineer it away.
+  Skip-entries-before-10:00 ≈ noise (±1-2pts; mildly helpful on 5Min).
+  Verdict: **sub-1Hour timeframes are ruled out for edge**; the 15Min bot
+  remains deployed only as a live friction-measurement experiment.
+- Time stops / stagnation exits (2026-07-13, `EXP tstop1d`/`EXP tstop1h`
+  rows; deployed configs, 2555d/730d, 70/30, c5): **pure time stops (exit
+  after N bars regardless) are ruinous** (1Day full 7y +119%→+21..+72%;
+  1Hour OOS negative) — more proof the edge is holding through dull
+  stretches. **Stagnation exits (exit at N bars only if price ≤ entry) do
+  cut losses as hypothesized** — 1Day stag-N10: loss total −31.3%→−25.1%,
+  OOS worst-symbol +23.4%→+28.0%, full 7y +119→+131 — but OOS *average*
+  is slightly worse (+41.6→+39.8) because freed dead trades sometimes
+  wake up: risk improves, return doesn't. On 1Hour every variant is worse
+  OOS. Rejected for deployment (no return edge, one more fitted knob);
+  1Day stag-N10 is the only borderline candidate if drawdown ever becomes
+  the binding constraint.
 - Trend-MA type (`MA_TYPE`: sma/ema/hma) on 1Day 55/40 over 1095d: HMA50 and
   EMA50 beat-or-match the deployed SMA50 on every symbol full-window (avg
   +76.7% / +74.5% vs +67.7%; unfiltered +68.7%). All differences sit in the

@@ -175,6 +175,14 @@ class Config:
     # Use 'raw' to reproduce backtests recorded before this setting existed.
     bar_adjustment: str = field(
         default_factory=lambda: os.environ.get("BAR_ADJUSTMENT", "all"))
+    # Simulators only: restrict entries/exits to bars the live bot could act
+    # on (bar close inside regular NY trading hours). IEX bars span 4am-8pm
+    # ET, but live `run_once` skips closed markets and signals are
+    # edge-triggered on the latest bar, so an off-hours cross never fires
+    # live — it is missed, not delayed. "false" reproduces intraday
+    # backtests recorded before 2026-07-13, which traded all hours.
+    rth_only: bool = field(
+        default_factory=lambda: os.environ.get("RTH_ONLY", "true").lower() != "false")
     # Starting cash for the `portfolio` simulator (mirrors the planned live
     # account; not used by live trading, which reads real account equity).
     start_equity: float = field(
@@ -746,6 +754,18 @@ class RsiMidlineBot:
             cross_up &= htf_rsi_ok(df, HTF_RULES[self.cfg.htf_timeframe],
                                    self.cfg.htf_rsi_level, self.cfg.rsi_period,
                                    self.bar_len())
+        # Live only acts on a bar whose close lands inside regular NY hours
+        # (run_once skips closed markets; a bar ending at 16:00 completes at
+        # the bell, after the last actionable poll). Mask both directions —
+        # an off-hours sell cross is held through, not fast-forwarded — while
+        # the indicators above still warm up on every bar, exactly like live.
+        # Approximation: fixed 9:30-16:00, ignores half-day early closes.
+        if self.cfg.rth_only and self.timeframe.unit != TimeFrameUnit.Day:
+            ends = (df.index + self.bar_len()).tz_convert("America/New_York")
+            mins = ends.hour * 60 + ends.minute
+            actionable = pd.Series((mins >= 570) & (mins < 960), index=df.index)
+            cross_up &= actionable
+            cross_down &= actionable
         return cross_up, cross_down
 
     def simulate_portfolio(
@@ -955,6 +975,10 @@ class RsiMidlineBot:
         suffix = ""
         if self.cfg.ma_type != "sma":
             suffix += f" [{self.cfg.ma_type}]"
+        if htf_ok and not self.cfg.rth_only:
+            print("GLOBAL: RTH_ONLY=false — acting on extended-hours bars "
+                  "live trading never sees (pre-2026-07-13 behavior)")
+            suffix += " [all-hours]"
         if htf_ok and self.cfg.htf_rsi_level:
             print(f"GLOBAL FILTER on all variants: {self.cfg.htf_timeframe} "
                   f"RSI > {self.cfg.htf_rsi_level:g}")
@@ -992,7 +1016,10 @@ class RsiMidlineBot:
         self._log_backtest_results(results)
         print(f"\nNote: fills at signal-bar close; friction COST_BPS="
               f"{self.cfg.cost_bps:g} bps/side; bars adjustment="
-              f"'{self.cfg.bar_adjustment}'. Each symbol simulated in "
+              f"'{self.cfg.bar_adjustment}'"
+              + (f"; signals restricted to 9:30-16:00 ET (RTH_ONLY=true)"
+                 if htf_ok and self.cfg.rth_only else "")
+              + ". Each symbol simulated in "
               f"isolation, 100% invested — see `portfolio` for shared-account "
               f"sizing.\n")
 
