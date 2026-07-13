@@ -37,6 +37,7 @@ python rsi_midline_bot.py run       # evaluate signals once and place orders
 python rsi_midline_bot.py loop      # keep running, checking every POLL_SECONDS
 python rsi_midline_bot.py tune      # grid-search + walk-forward validation
 python rsi_midline_bot.py trades    # show the trade journal (add a number for more rows)
+python rsi_midline_bot.py replay    # re-simulate the live period, diff vs the journal
 ```
 
 ### Backtesting variants & the experiment log
@@ -66,6 +67,33 @@ trades into round trips and check the realized win rate per settings profile.
 Query it directly with `sqlite3 trades.db "SELECT * FROM trades"` or via
 `python rsi_midline_bot.py trades 50` for the last 50 entries. Set `TRADES_DB`
 to change the location.
+
+### Replay: does live match the backtest?
+
+`replay` is the ongoing answer to "is the backtest telling the truth?": it
+re-simulates the strategy over exactly the live period — same config, same
+signal code the backtest uses — and diffs the simulated trade list against
+the journal, bar by bar. Every event is `OK` (both agree), `SIM-ONLY` (the
+strategy called for a trade live never took: downtime, a veto, a sizing
+skip, a data problem) or `LIVE-ONLY` (live traded when the simulation says
+it shouldn't have). Either mismatch means live behavior and backtest
+assumptions have diverged — caught within days, not months later in the
+P&L. A divergence like the extended-hours gap (backtests trading 4am bars
+live could never act on) would show up here on day one.
+
+The window starts at `REPLAY_SINCE` (set it to the instance's go-live
+moment; the sim starts flat there, like a freshly reset paper account) or
+the first journal row; `replay 2026-07-12` overrides it. Journal rows also
+record the settings each trade ran with, so the report flags **config
+drift** — trades taken under settings that differ from what you're
+replaying. Exit code is non-zero on any mismatch, so it works in scripts
+and timers; the deployed bots run it weekly (see `deploy/README.md`).
+
+Three disagreements are honest and expected in small doses: daily bars are
+evaluated live ~10 min before the close on a near-final bar; bars re-adjust
+after every dividend, so history fetched today differs slightly from what
+live saw before an ex-div date; trailing-stop fills happen at intraday
+prices, not bar closes.
 
 ### Tune mode
 

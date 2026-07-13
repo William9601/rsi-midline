@@ -21,6 +21,9 @@ Usage:
     python rsi_midline_bot.py trades     # show the trade journal (SQLite)
     python rsi_midline_bot.py pnl [db..] # round-trip P&L / losing-trade stats
                                          # from the journal(s)
+    python rsi_midline_bot.py replay [since]  # re-simulate the live period
+                                         # with the resolved config and diff
+                                         # the sim's trades vs the journal
 """
 
 from __future__ import annotations
@@ -417,6 +420,12 @@ def show_pnl(db_paths: list[str] | None = None) -> None:
                   f"positions opened before journaling)")
 
 
+def _utc_ts(s: str) -> pd.Timestamp:
+    """Parse an ISO timestamp (journal `ts`, REPLAY_SINCE) as tz-aware UTC."""
+    ts = pd.Timestamp(s.replace("Z", "+00:00"))
+    return ts.tz_localize("UTC") if ts.tz is None else ts.tz_convert("UTC")
+
+
 # ---------------------------------------------------------------------------
 # Bot
 # ---------------------------------------------------------------------------
@@ -605,6 +614,25 @@ class RsiMidlineBot:
 
     # -- main passes ----------------------------------------------------------
 
+    def _live_fetch_days(self) -> int:
+        """History depth a live pass fetches: enough to warm up the RSI, the
+        trend MA and the HTF filters. `replay` adds its window on top of this
+        so the re-simulation warms up on the same depth live had."""
+        if self.timeframe.unit == TimeFrameUnit.Day:
+            return max(200, int((self.cfg.trend_ma + self.cfg.rsi_period) * 1.6) + 30)
+        days = 60 if self.cfg.trend_ma else 30
+        if self.cfg.htf_ma or self.cfg.htf_rsi_level:
+            # The HTF filters need enough *higher-timeframe* bars or their
+            # MA/RSI is all-NaN and every buy gets vetoed (a 1Day MA50
+            # needs ~50 trading days — far more than the base 30 calendar).
+            # Wilder RSI needs ~3x its period to converge after warmup.
+            htf_bars = max(self.cfg.htf_ma,
+                           3 * self.cfg.rsi_period if self.cfg.htf_rsi_level else 0)
+            htf_hours = {"1Hour": 1, "4Hour": 4, "1Day": 6.5}[self.cfg.htf_timeframe]
+            htf_trading_days = htf_bars * htf_hours / 6.5
+            days = max(days, int(htf_trading_days * 1.6) + 10)
+        return days
+
     def run_once(self) -> None:
         if self.cfg.trail_percent:
             self.reconcile_stop_fills()
@@ -613,21 +641,7 @@ class RsiMidlineBot:
             log.info("Market closed (next open %s), skipping pass", clock.next_open)
             return
         # Enough history to warm up the RSI and trend MA regardless of timeframe.
-        if self.timeframe.unit == TimeFrameUnit.Day:
-            days = max(200, int((self.cfg.trend_ma + self.cfg.rsi_period) * 1.6) + 30)
-        else:
-            days = 60 if self.cfg.trend_ma else 30
-            if self.cfg.htf_ma or self.cfg.htf_rsi_level:
-                # The HTF filters need enough *higher-timeframe* bars or their
-                # MA/RSI is all-NaN and every buy gets vetoed (a 1Day MA50
-                # needs ~50 trading days — far more than the base 30 calendar).
-                # Wilder RSI needs ~3x its period to converge after warmup.
-                htf_bars = max(self.cfg.htf_ma,
-                               3 * self.cfg.rsi_period if self.cfg.htf_rsi_level else 0)
-                htf_hours = {"1Hour": 1, "4Hour": 4, "1Day": 6.5}[self.cfg.htf_timeframe]
-                htf_trading_days = htf_bars * htf_hours / 6.5
-                days = max(days, int(htf_trading_days * 1.6) + 10)
-        bars = self.fetch_bars(self.cfg.symbols, days=days)
+        bars = self.fetch_bars(self.cfg.symbols, days=self._live_fetch_days())
         for symbol in self.cfg.symbols:
             symbol = symbol.strip().upper()
             try:
@@ -1102,6 +1116,239 @@ class RsiMidlineBot:
               f"hold {bh_dd:.1f}% — the number the per-symbol backtest "
               f"can't see)\n")
 
+    # -- replay: live period vs journal ---------------------------------------
+
+    def _actionable_times(self, index: pd.DatetimeIndex) -> pd.DatetimeIndex:
+        """When live could first act on each bar: intraday bars at their
+        close, daily bars at the ~15:50 ET evaluation (10 min before the
+        bell, where the daily loop wakes up)."""
+        if self.timeframe.unit == TimeFrameUnit.Day:
+            ny = index.tz_convert("America/New_York")
+            return (ny.normalize()
+                    + pd.Timedelta(hours=15, minutes=50)).tz_convert("UTC")
+        return index + self.bar_len()
+
+    def _bar_for_ts(self, index: pd.DatetimeIndex, ts: pd.Timestamp):
+        """The bar a journal row acted on: the last completed bar at the
+        journal timestamp (daily: the bar of that ET trading day, which live
+        evaluates just before its own close)."""
+        if self.timeframe.unit == TimeFrameUnit.Day:
+            d = ts.tz_convert("America/New_York").date()
+            hits = index[index.tz_convert("America/New_York").date == d]
+            return hits[0] if len(hits) else None
+        pos = (index + self.bar_len()).searchsorted(ts, side="right") - 1
+        return index[pos] if pos >= 0 else None
+
+    def _sim_trade_events(self, df: pd.DataFrame,
+                          since: pd.Timestamp) -> tuple[list[tuple], pd.Series]:
+        """Replay the live decision sequence on one symbol: the same signal
+        source and position state machine as `simulate()`, but starting FLAT
+        at `since` (crosses from before the bot existed never fired live)
+        and returning the trade events instead of aggregate returns.
+
+        Returns ([(bar_ts, side, close, rsi)], rsi_series)."""
+        htf_ok = self.timeframe.unit != TimeFrameUnit.Day
+        cross_up, cross_down = self.entry_exit_signals(
+            df, self.cfg.rsi_buy, self.cfg.rsi_sell, self.cfg.trend_ma,
+            self.cfg.vol_mult, self.cfg.htf_ma if htf_ok else 0)
+        r = rsi(df["close"], self.cfg.rsi_period)
+        acts = self._actionable_times(df.index)
+        now = pd.Timestamp.now(tz="UTC")
+        trail = self.cfg.trail_percent
+        events: list[tuple] = []
+        in_pos, hwm = False, 0.0
+        for i in range(len(df)):
+            # Bars live never got to act on (before go-live, or a daily bar
+            # whose evaluation window hasn't arrived yet) don't move state.
+            if not (since <= acts[i] <= now):
+                continue
+            c = float(df["close"].iloc[i])
+            exited = False
+            if in_pos:
+                hwm = max(hwm, c)
+                if cross_down.iloc[i] or (trail and c <= hwm * (1 - trail / 100)):
+                    events.append((df.index[i], "sell", c, float(r.iloc[i])))
+                    in_pos, exited = False, True
+            if not in_pos and cross_up.iloc[i] and not exited:
+                events.append((df.index[i], "buy", c, float(r.iloc[i])))
+                in_pos, hwm = True, c
+        return events, r
+
+    def replay(self, since_arg: str | None = None) -> int:
+        """Re-simulate the live period with the resolved config and diff the
+        simulated trade list against the journal (TRADES_DB).
+
+        The production version of the repo's 'identical rows' verification
+        habit: any SIM-only or LIVE-only event means live behavior and
+        backtest assumptions have diverged — a strategy/data bug caught
+        within days instead of surfacing in the P&L months later (the
+        extended-hours gap would have shown up on day one). Returns the
+        mismatch count; main() maps it to the exit code so the weekly
+        systemd run turns red on divergence.
+
+        Window start: `since` argument, else REPLAY_SINCE (set it to the
+        instance's go-live moment), else the first journal row. The sim
+        starts FLAT at that moment, like the freshly reset paper account.
+
+        Honest disagreements this will surface (explain, don't paper over):
+        daily bars are evaluated live ~10 min before the close on a
+        near-final bar; BAR_ADJUSTMENT=all re-adjusts history after every
+        dividend, so bars fetched today differ slightly from what live saw
+        before an ex-div date; server-side trailing stops fill at real
+        intraday prices, not bar closes.
+        """
+        cfg = self.cfg
+        daily = self.timeframe.unit == TimeFrameUnit.Day
+        db_path = os.environ.get("TRADES_DB") or os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "trades.db")
+        rows: list[tuple] = []
+        if os.path.exists(db_path):
+            # Read-only connection: never contends with the live bot's writes
+            # (the rw journal the constructor opened is left untouched).
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            rows = conn.execute(
+                "SELECT ts, symbol, side, price, rsi, timeframe, rsi_buy,"
+                " rsi_sell, trend_ma, vol_mult, htf_ma, ma_type, htf_rsi"
+                " FROM trades ORDER BY id").fetchall()
+            conn.close()
+        since_s = (since_arg or os.environ.get("REPLAY_SINCE")
+                   or (rows[0][0] if rows else None))
+        if not since_s:
+            sys.exit("replay: journal is empty and no window start given — "
+                     "set REPLAY_SINCE to the bot's go-live time (so a bot "
+                     "that WRONGLY never trades still gets checked) or pass "
+                     "a date: rsi_midline_bot.py replay 2026-07-12")
+        since = _utc_ts(since_s)
+        window_days = max(int((pd.Timestamp.now(tz="UTC") - since).days) + 2, 3)
+        symbols = [s.strip().upper() for s in cfg.symbols]
+        days = self._live_fetch_days() + window_days
+        log.info("Replay since %s: fetching %d days of %s bars for %s...",
+                 since, days, cfg.timeframe, ",".join(symbols))
+        bars = self.fetch_bars(symbols, days=days)
+
+        htf_ok = not daily
+        print(f"\nReplay vs journal: {cfg.timeframe} {','.join(symbols)} "
+              f"since {since:%Y-%m-%d %H:%M} UTC\njournal: {db_path}")
+        print(f"config: RSI({cfg.rsi_period}) band {cfg.rsi_buy:g}/{cfg.rsi_sell:g}, "
+              f"MA {cfg.trend_ma} ({cfg.ma_type}), vol x{cfg.vol_mult:g}, "
+              f"trail {cfg.trail_percent:g}%"
+              + (f", {cfg.htf_timeframe} MA{cfg.htf_ma}"
+                 if htf_ok and cfg.htf_ma else "")
+              + (f", {cfg.htf_timeframe} RSI>{cfg.htf_rsi_level:g}"
+                 if htf_ok and cfg.htf_rsi_level else ""))
+        if cfg.trail_percent:
+            print("NOTE: TRAIL_PERCENT set — server-side stop fills happen at "
+                  "intraday prices; expect bar-level mismatches on stopped "
+                  "exits (the sim exits on bar closes).")
+
+        # Journal rows carry the settings each trade ran with: rows that
+        # disagree with the replay config mean the config changed mid-window
+        # (or the replay is running the wrong env) — mismatches below would
+        # be expected, not bugs.
+        live_rows = [r_ for r_ in rows if _utc_ts(r_[0]) >= since]
+        current = {"timeframe": cfg.timeframe, "rsi_buy": cfg.rsi_buy,
+                   "rsi_sell": cfg.rsi_sell, "trend_ma": cfg.trend_ma,
+                   "vol_mult": cfg.vol_mult, "htf_ma": cfg.htf_ma,
+                   "ma_type": cfg.ma_type, "htf_rsi": cfg.htf_rsi_level}
+        drift: dict[tuple, int] = {}
+        for r_ in live_rows:
+            row_cfg = dict(zip(current, r_[5:13]))
+            diffs = tuple(f"{k}={row_cfg[k]!r} (replaying {current[k]!r})"
+                          for k in current
+                          if row_cfg[k] is not None and row_cfg[k] != current[k])
+            if diffs:
+                drift[diffs] = drift.get(diffs, 0) + 1
+        for diffs, n in drift.items():
+            print(f"CONFIG DRIFT on {n} journal row(s): " + ", ".join(diffs))
+
+        rows_by_sym: dict[str, list[tuple]] = {}
+        for r_ in live_rows:
+            rows_by_sym.setdefault(r_[1], []).append(r_)
+        matched = mismatches = 0
+        # Journal rows for symbols the replay config doesn't trade can't be
+        # simulated at all — count them as mismatches, don't drop them.
+        for sym in sorted(set(rows_by_sym) - set(symbols)):
+            n = len(rows_by_sym[sym])
+            print(f"\n{sym}: {n} journal row(s) but symbol not in SYMBOLS — "
+                  f"can't replay (config drift)")
+            mismatches += n
+
+        fmt = "%Y-%m-%d" if daily else "%Y-%m-%d %H:%M"
+        for symbol in symbols:
+            df = self.closed_bars(symbol, bars)
+            if df is None or df.empty:
+                print(f"\n{symbol}: no bar data")
+                continue
+            events, r_series = self._sim_trade_events(df, since)
+            sim_map: dict[tuple, list[tuple]] = {}
+            for ts, side, close, rv in events:
+                sim_map.setdefault((ts, side), []).append((close, rv))
+            live_map: dict[tuple, list[tuple]] = {}
+            unmapped: list[tuple] = []
+            for r_ in rows_by_sym.get(symbol, []):
+                bar = self._bar_for_ts(df.index, _utc_ts(r_[0]))
+                if bar is None:
+                    unmapped.append(r_)
+                else:
+                    live_map.setdefault((bar, r_[2]), []).append(r_)
+            keys = sorted(set(sim_map) | set(live_map))
+            if not keys and not unmapped:
+                print(f"\n{symbol}: no trades (sim or journal)")
+                continue
+            print(f"\n{symbol}")
+            print(f"  {'signal bar (ET)':<18}{'side':<6}{'status':<11}"
+                  f"{'px sim/live':>18}{'rsi sim/live':>15}")
+            for bar_ts, side in keys:
+                sims = sim_map.get((bar_ts, side), [])
+                lives = live_map.get((bar_ts, side), [])
+                label = bar_ts.tz_convert("America/New_York").strftime(fmt)
+                for i in range(max(len(sims), len(lives))):
+                    s = sims[i] if i < len(sims) else None
+                    l = lives[i] if i < len(lives) else None
+                    if s and l:
+                        matched += 1
+                        status = "OK"
+                        px = (f"{s[0]:.2f}/{l[3]:.2f}"
+                              if l[3] is not None else f"{s[0]:.2f}/?")
+                        rs = (f"{s[1]:.1f}/{l[4]:.1f}"
+                              if l[4] is not None else f"{s[1]:.1f}/?")
+                        # Price drift beyond ~re-adjustment size, or RSI far
+                        # from what live logged, deserves a second look even
+                        # though the bars matched.
+                        if (l[3] and abs(l[3] / s[0] - 1) > (0.01 if daily else 0.002)) \
+                                or (l[4] is not None and abs(l[4] - s[1]) > 1.0):
+                            status = "OK?"
+                    elif s:
+                        mismatches += 1
+                        status, px, rs = "SIM-ONLY", f"{s[0]:.2f}/-", f"{s[1]:.1f}/-"
+                    else:
+                        mismatches += 1
+                        sim_rsi = float(r_series.loc[bar_ts])
+                        status = "LIVE-ONLY"
+                        px = (f"-/{l[3]:.2f}" if l[3] is not None else "-/?")
+                        rs = (f"{sim_rsi:.1f}/{l[4]:.1f}"
+                              if l[4] is not None else f"{sim_rsi:.1f}/?")
+                    print(f"  {label:<18}{side:<6}{status:<11}{px:>18}{rs:>15}")
+            for r_ in unmapped:
+                mismatches += 1
+                print(f"  {r_[0][:16]:<18}{r_[2]:<6}{'LIVE-ONLY':<11}"
+                      f"{'no bar for journal ts':>33}")
+
+        verdict = "MISMATCH" if mismatches else "OK"
+        print(f"\nREPLAY {verdict}: {matched} matched, {mismatches} "
+              f"mismatched event(s) since {since:%Y-%m-%d}.")
+        if mismatches:
+            print("The FIRST mismatch is the root-cause candidate: position "
+                  "state diverges there, so later rows can be knock-on "
+                  "effects. SIM-ONLY = live missed a trade the strategy "
+                  "called for (downtime? veto? sizing skip?); LIVE-ONLY = "
+                  "live traded when the re-simulation wouldn't (data "
+                  "revision? borderline RSI? config drift above?).")
+        print("(bars re-adjust after each dividend, so pre-ex-div prices can "
+              "drift ~the dividend size; daily rows are evaluated live 10 min "
+              "before the close on a near-final bar)")
+        return mismatches
+
     def _log_backtest_results(self, rows: list[dict]) -> None:
         """Append every variant result to backtest_results.csv for comparison
         across runs — the experiment log that survives the terminal scrollback."""
@@ -1292,7 +1539,8 @@ class RsiMidlineBot:
 
 def main() -> None:
     mode = sys.argv[1] if len(sys.argv) > 1 else "run"
-    if mode not in ("run", "loop", "backtest", "portfolio", "tune", "trades", "pnl"):
+    if mode not in ("run", "loop", "backtest", "portfolio", "tune", "trades",
+                    "pnl", "replay"):
         print(__doc__)
         sys.exit(1)
     load_dotenv()
@@ -1321,6 +1569,10 @@ def main() -> None:
         bot.show_trades(limit)
     elif mode == "portfolio":
         bot.portfolio()
+    elif mode == "replay":
+        # Non-zero exit on divergence so the weekly systemd run shows failed.
+        sys.exit(1 if bot.replay(sys.argv[2] if len(sys.argv) > 2 else None)
+                 else 0)
     else:
         bot.backtest()
 

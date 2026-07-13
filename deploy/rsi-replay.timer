@@ -1,0 +1,12 @@
+# Saturdays 12:00 UTC: the market week is closed, so every bar the bots
+# could have acted on is final — the replay window is complete.
+[Unit]
+Description=Weekly RSI bot replay check
+
+[Timer]
+OnCalendar=Sat *-*-* 12:00:00 UTC
+# Catch up if the droplet was down at the scheduled moment.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

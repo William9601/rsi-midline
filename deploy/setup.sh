@@ -24,7 +24,10 @@ chown -R rsibot:rsibot /opt/rsi-midline-bot
 chmod 600 deploy/env/*.env 2>/dev/null || true
 
 cp deploy/rsi-bot@.service /etc/systemd/system/
+# Weekly replay check: re-simulate each bot's live period, diff vs journal.
+cp deploy/rsi-replay.service deploy/rsi-replay.timer /etc/systemd/system/
 systemctl daemon-reload
+systemctl enable --now rsi-replay.timer
 
 # Start one instance per real env file (examples don't count).
 started=0

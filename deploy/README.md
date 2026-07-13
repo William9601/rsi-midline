@@ -51,9 +51,32 @@ To ship code/profile changes: re-run the same `rsync` + `setup.sh` pair
 (idempotent; restarts the bots). Restarts are safe mid-day — signals are
 edge-triggered and entry/exit skip when the position already matches.
 
+## Weekly replay check (live vs backtest)
+
+`setup.sh` also installs `rsi-replay.timer`: every Saturday 12:00 UTC (the
+market week is closed, so every bar the bots could act on is final),
+`deploy/replay-check.sh` re-simulates each instance's live period with its
+exact env config and diffs the simulated trade list against its journal —
+the production version of the repo's "identical rows" verification habit.
+Any `SIM-ONLY`/`LIVE-ONLY` row is a live-vs-backtest divergence caught
+within days; the service exits non-zero so it shows up in
+`systemctl --failed`.
+
+```bash
+ssh root@SERVER systemctl status rsi-replay.timer        # next scheduled run
+ssh root@SERVER systemctl start rsi-replay               # run it right now
+ssh root@SERVER journalctl -u rsi-replay                 # full reports
+ssh root@SERVER cat /opt/rsi-midline-bot/replay-report.txt
+```
+
+Each env file's `REPLAY_SINCE` is the moment that instance went live with
+its current config — **update it whenever you swap a bot's strategy
+settings**, or the replay will simulate the new config over trades the old
+one took and report drift.
+
 ## Safety
 
 - Every committed env example sets `ALPACA_PAPER=true`. Going live means
   editing a server env file by hand — never commit a live key.
-- `run`/`loop` place orders; everything else is read-only. The services only
-  run `loop`.
+- `run`/`loop` place orders; everything else is read-only. The bot services
+  only run `loop`; the replay timer only runs `replay` (never trades).

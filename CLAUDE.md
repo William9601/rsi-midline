@@ -24,6 +24,10 @@ append-only experiment log every backtest writes to).
 .venv/bin/python rsi_midline_bot.py trades 50  # show trade journal
 .venv/bin/python rsi_midline_bot.py pnl [db..] # round-trip P&L + losing-trade %
                                                # from journal(s); read-only
+.venv/bin/python rsi_midline_bot.py replay     # re-simulate the live period with
+                                               # the resolved config and diff vs the
+                                               # journal (TRADES_DB); read-only;
+                                               # exit 1 on any mismatch
 ```
 
 - The venv is Python **3.9** — keep `from __future__ import annotations`; no 3.10+ syntax at runtime.
@@ -112,6 +116,29 @@ Don't bypass that gate; when editing profiles by hand, update the notes.
   when set they affect **every** backtest variant in the run, and variant
   names get a `[...]` suffix so `backtest_results.csv` rows stay unambiguous.
   Neither is in the tune grid.
+
+## Replay verification (live vs backtest, weekly)
+
+`replay` re-simulates the live period (flat start at `REPLAY_SINCE`, the
+instance's go-live moment) with the same `entry_exit_signals()` the backtest
+uses, then diffs simulated trade events against the journal bar-by-bar —
+`SIM-ONLY`/`LIVE-ONLY` rows are live-vs-backtest divergences (this is the
+check that would have caught the extended-hours gap on day one). Deployed as
+`rsi-replay.timer` (Saturdays; `deploy/replay-check.sh` loops over
+`deploy/env/*.env`). Maintenance rules:
+
+- `_sim_trade_events` must mirror live's decision sequence: it consumes
+  `entry_exit_signals()` and replicates `enter`/`exit` position-state
+  skipping. When changing live behavior or `simulate()`, keep it in step.
+- `_live_fetch_days()` is the shared warmup-depth source for `run_once` and
+  `replay` — change fetch sizing there only.
+- Journal timestamps map to signal bars via `_bar_for_ts` (intraday: last
+  bar-close ≤ ts; daily: the ET-date bar, since live evaluates ~15:50 ET).
+- **Update `REPLAY_SINCE` in the instance env file on every config swap**,
+  or replay simulates the new config over the old config's trades.
+- Expected honest disagreements (explain, don't "fix"): daily rows evaluated
+  10 min pre-close on a near-final bar; `BAR_ADJUSTMENT=all` re-adjusts
+  history after each dividend; trailing-stop fills at intraday prices.
 
 ## Live-trading invariants
 

@@ -1,0 +1,13 @@
+# Weekly live-vs-backtest reconciliation (started by rsi-replay.timer).
+# Fails (visible in `systemctl --failed` and `systemctl status rsi-replay`)
+# when any bot's journal diverges from the re-simulation of its live period.
+[Unit]
+Description=RSI bot replay check: journal vs re-simulated live period
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=rsibot
+WorkingDirectory=/opt/rsi-midline-bot
+ExecStart=/usr/bin/bash /opt/rsi-midline-bot/deploy/replay-check.sh
