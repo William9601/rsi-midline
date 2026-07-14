@@ -44,7 +44,7 @@ from datetime import datetime, timedelta, timezone
 
 import numpy as np
 import pandas as pd
-from alpaca.data.enums import Adjustment
+from alpaca.data.enums import Adjustment, DataFeed
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
@@ -178,6 +178,11 @@ class Config:
     # Use 'raw' to reproduce backtests recorded before this setting existed.
     bar_adjustment: str = field(
         default_factory=lambda: os.environ.get("BAR_ADJUSTMENT", "all"))
+    # Alpaca data feed: iex | sip | '' (empty = the account subscription's
+    # default — SIP full-market data on Algo Trader Plus, IEX otherwise).
+    # Every recorded result is SIP; 'iex' is for feed-difference experiments.
+    data_feed: str = field(
+        default_factory=lambda: os.environ.get("DATA_FEED", ""))
     # Simulators only: restrict entries/exits to bars the live bot could act
     # on (bar close inside regular NY trading hours). IEX bars span 4am-8pm
     # ET, but live `run_once` skips closed markets and signals are
@@ -444,6 +449,9 @@ class RsiMidlineBot:
         if cfg.bar_adjustment not in [a.value for a in Adjustment]:
             raise ValueError(
                 f"BAR_ADJUSTMENT must be one of {[a.value for a in Adjustment]}")
+        if cfg.data_feed and cfg.data_feed not in [f.value for f in DataFeed]:
+            raise ValueError(
+                f"DATA_FEED must be one of {[f.value for f in DataFeed]} or unset")
         self.timeframe = TIMEFRAMES[cfg.timeframe]
         db_path = os.environ.get("TRADES_DB") or os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "trades.db")
@@ -457,6 +465,9 @@ class RsiMidlineBot:
             timeframe=self.timeframe,
             start=datetime.now(timezone.utc) - timedelta(days=days),
             adjustment=Adjustment(self.cfg.bar_adjustment),
+            # None lets the server pick the subscription default (SIP on
+            # Algo Trader Plus); DATA_FEED=iex reproduces free-tier data.
+            feed=DataFeed(self.cfg.data_feed) if self.cfg.data_feed else None,
         )
         return self.data.get_stock_bars(req).df
 

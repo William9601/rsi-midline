@@ -164,13 +164,22 @@ check that would have caught the extended-hours gap on day one). Deployed as
   rvol is recorded even when the volume filter is off — intentional, for
   later analysis. Each deployed instance gets its own journal file.
 
-## Data caveats (free Alpaca tier)
+## Data caveats
 
-- Historical bars come from the IEX feed: prices are near-consolidated but
-  **volumes are a small unreliable slice** — treat volume-filter backtests
-  with suspicion. Intraday bars cover the extended 4am–8pm ET session;
-  pre-market bars are thin (a 15Min "close" can be one odd-lot print). See
-  `RTH_ONLY` above for how the simulators handle this.
+- The account has Alpaca's **Algo Trader Plus** subscription (predates this
+  project, confirmed 2026-07-13): bar fetches default to the consolidated
+  **SIP** feed — real full-market prices AND volumes — so **every row in
+  backtest_results.csv and all live trading have been SIP from day one**.
+  Verified empirically: SPY 9:45 ET bar on 2026-07-13 is 1.49M shares on SIP
+  vs 36k on IEX (closes 753.62 vs 753.59); the live journal price matches
+  SIP, so the droplet's paper keys inherit the subscription too.
+  `DATA_FEED=iex` fetches free-tier data (never used here; on 15Min bars it
+  produces materially different RSI signals — feed is part of the system).
+  If the subscription ever lapses, fetches silently fall back to IEX — the
+  "volumes are a small unreliable slice" free-tier caveat would then apply.
+- Intraday bars cover the extended 4am–8pm ET session. Off-hours bars are
+  real consolidated prints on SIP, but live still can't act on them (market
+  closed) — the `RTH_ONLY` mask is about market hours, not feed quality.
 - Bars are split/dividend-adjusted by default since 2026-07-12
   (`BAR_ADJUSTMENT=all`; set `raw` to reproduce older baselines). Adjustment
   shifts results materially: dividends add 3-6 points to 3-yr ETF buy & hold,
