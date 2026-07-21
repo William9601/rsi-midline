@@ -779,16 +779,30 @@ class RsiMidlineBot:
             cross_up &= htf_rsi_ok(df, HTF_RULES[self.cfg.htf_timeframe],
                                    self.cfg.htf_rsi_level, self.cfg.rsi_period,
                                    self.bar_len())
-        # Live only acts on a bar whose close lands inside regular NY hours
-        # (run_once skips closed markets; a bar ending at 16:00 completes at
-        # the bell, after the last actionable poll). Mask both directions —
-        # an off-hours sell cross is held through, not fast-forwarded — while
-        # the indicators above still warm up on every bar, exactly like live.
-        # Approximation: fixed 9:30-16:00, ignores half-day early closes.
+        # Live evaluates the LATEST completed bar at each poll, so a bar is
+        # actionable iff the market is open at some instant between its end
+        # and the next bar's end. That covers every in-session bar (ends
+        # before 16:00 — one ending AT 16:00 completes at the bell, after the
+        # last actionable poll) PLUS the last bar to complete at-or-before
+        # the open: e.g. the 8-9am 1Hour bar is still the latest completed
+        # bar at the first post-open poll, and live trades it (confirmed
+        # live 2026-07-14 — QQQ/GLD/IWM entries at 9:51 ET on the 8-9 bar).
+        # Mask both directions — an off-hours sell cross on a non-actionable
+        # bar is held through, not fast-forwarded — while the indicators
+        # above still warm up on every bar, exactly like live.
+        # Approximations: fixed 9:30-16:00, ignores half-day early closes;
+        # a pre-open bar's entry is booked at its own close although live
+        # fills after 9:30 (pre-open drift accrues to the sim trade); assumes
+        # a poll lands inside each bar's open window (needs POLL_SECONDS ≤
+        # 30 min on 1Hour bars — the 9:30-10:00 window is exactly one poll).
         if self.cfg.rth_only and self.timeframe.unit != TimeFrameUnit.Day:
             ends = (df.index + self.bar_len()).tz_convert("America/New_York")
+            nxt_ends = ends[1:].append(ends[-1:] + self.bar_len())
             mins = ends.hour * 60 + ends.minute
-            actionable = pd.Series((mins >= 570) & (mins < 960), index=df.index)
+            nxt_mins = nxt_ends.hour * 60 + nxt_ends.minute
+            actionable = pd.Series(
+                (mins < 960) & ((nxt_mins > 570) | (nxt_ends.date != ends.date)),
+                index=df.index)
             cross_up &= actionable
             cross_down &= actionable
         return cross_up, cross_down
@@ -1042,7 +1056,8 @@ class RsiMidlineBot:
         print(f"\nNote: fills at signal-bar close; friction COST_BPS="
               f"{self.cfg.cost_bps:g} bps/side; bars adjustment="
               f"'{self.cfg.bar_adjustment}'"
-              + (f"; signals restricted to 9:30-16:00 ET (RTH_ONLY=true)"
+              + (f"; signals restricted to live-actionable bars: 9:30-16:00 ET"
+                 f" closes + the last pre-open bar (RTH_ONLY=true)"
                  if htf_ok and self.cfg.rth_only else "")
               + ". Each symbol simulated in "
               f"isolation, 100% invested — see `portfolio` for shared-account "
@@ -1131,13 +1146,17 @@ class RsiMidlineBot:
 
     def _actionable_times(self, index: pd.DatetimeIndex) -> pd.DatetimeIndex:
         """When live could first act on each bar: intraday bars at their
-        close, daily bars at the ~15:50 ET evaluation (10 min before the
-        bell, where the daily loop wakes up)."""
+        close — but no earlier than that day's 9:30 ET open, since a
+        pre-open bar (e.g. the 8-9am 1Hour bar) is only evaluated by the
+        first post-open poll — and daily bars at the ~15:50 ET evaluation
+        (10 min before the bell, where the daily loop wakes up)."""
+        ny = index.tz_convert("America/New_York")
         if self.timeframe.unit == TimeFrameUnit.Day:
-            ny = index.tz_convert("America/New_York")
             return (ny.normalize()
                     + pd.Timedelta(hours=15, minutes=50)).tz_convert("UTC")
-        return index + self.bar_len()
+        ends = ny + self.bar_len()
+        opens = ends.normalize() + pd.Timedelta(hours=9, minutes=30)
+        return pd.DatetimeIndex(np.maximum(ends, opens)).tz_convert("UTC")
 
     def _bar_for_ts(self, index: pd.DatetimeIndex, ts: pd.Timestamp):
         """The bar a journal row acted on: the last completed bar at the

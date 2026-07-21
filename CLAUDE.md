@@ -37,7 +37,9 @@ append-only experiment log every backtest writes to).
   past refactors). Baselines recorded before 2026-07-12 used raw bars and no
   friction: reproduce them with `BAR_ADJUSTMENT=raw COST_BPS=0`; intraday
   baselines recorded before 2026-07-13 also traded extended-hours bars — add
-  `RTH_ONLY=false`. A second identity check: the `active settings` backtest row
+  `RTH_ONLY=false`; intraday baselines from 2026-07-13/14 used a stricter RTH
+  mask that skipped last-pre-open-bar signals live does act on (corrected
+  2026-07-15, not reproducible via env). A second identity check: the `active settings` backtest row
   must exactly match any hardcoded variant with the same parameters (e.g. the
   15Min profile reproduces `Band + vol + MA200`). Strategy-logic pieces
   (`rsi`, `crossover_signal`, `htf_trend_ok`) can be tested standalone with
@@ -96,15 +98,23 @@ Don't bypass that gate; when editing profiles by hand, update the notes.
   each bar, fractional shares) and reports equity curve, max drawdown, and
   exposure. Both consume `entry_exit_signals()` — the single source of signal
   truth; keep it that way.
-- `RTH_ONLY` (default true): intraday simulations act only on bars whose
-  close falls inside regular NY hours (9:30–16:00 ET, fixed — half-day early
-  closes are ignored). IEX bars span 4am–8pm ET, but live `run_once` skips
-  closed markets and signals are edge-triggered on the latest bar, so an
-  off-hours cross is **missed live, not delayed** — before this mask ~half of
-  intraday backtest trades happened at times live could never act
-  (2026-07-13 finding). Indicators still warm up on every bar, matching live.
-  Masked in `entry_exit_signals`, so both simulators and `tune` inherit it;
-  a bar ending exactly at 16:00 is not actionable (completes at the bell).
+- `RTH_ONLY` (default true): intraday simulations act only on bars live can
+  actually evaluate. Live polls the *latest completed* bar while the market
+  is open, so a bar is actionable iff the market is open at some instant
+  between its close and the next bar's close: every bar closing inside
+  9:30–16:00 ET (exclusive of 16:00 — that bar completes at the bell), PLUS
+  the last bar to complete at-or-before the open (the 8–9am 1Hour bar, the
+  9:15–9:30 15Min bar), which the first post-open poll still sees as the
+  newest bar. Earlier off-hours crosses are superseded before live can act —
+  before this mask ~half of intraday backtest trades happened at times live
+  could never act (2026-07-13 finding); the pre-open-bar case was confirmed
+  live 2026-07-14 (QQQ/GLD/IWM 1Hour entries at 9:51 ET on the 8–9 bar) and
+  added 2026-07-15 — **intraday backtests recorded between those dates
+  dropped last-pre-open-bar signals live does take**. Fixed 9:30–16:00,
+  half-day early closes ignored; a pre-open bar's fill is booked at its own
+  close though live fills after 9:30; assumes POLL_SECONDS ≤ 30 min on
+  1Hour bars. Indicators still warm up on every bar, matching live. Masked
+  in `entry_exit_signals`, so both simulators and `tune` inherit it.
 - The HTF trend filter (`htf_trend_ok`) resamples the trading bars *up* to
   `HTF_TIMEFRAME` and aligns so each trading bar only sees HTF bars that had
   fully closed by the time the bar itself closed — preserve this no-look-ahead
