@@ -1,13 +1,13 @@
 {
   "_readme": "Tuned per-timeframe defaults, applied automatically based on TIMEFRAME. Anything set explicitly in .env or the shell overrides these. Run 'python rsi_midline_bot.py tune' to re-tune with walk-forward validation (it updates this file only if the winner holds up out-of-sample), or edit by hand and update 'tuned'/'notes' so the evidence stays with the numbers.",
   "1Day": {
-    "tuned": "2026-07-12",
+    "tuned": "2026-07-30",
     "status": "backtested (walk-forward, 3y + 7y)",
-    "notes": "Sell deepened 40 -> 35 after the 2026-07-12 630-combo sweep (RSI period x band x MA, 1095d + 2555d validation, 70/30 walk-forward): sell 30-35 beats sell 40 across nearly every period/band/MA and every symbol on both windows — a plateau, not a spike. 7y (2555d) walk-forward for 55/35 MA50, test window incl. the 2025 downtrend: test avg +50.5% vs +45.0% for the prior 55/40, worst-symbol test +36.5% vs +26.1% (full 7y +124% vs +128%, trades 13-17/symbol). 3y sell-35 variants also beat deployed OOS (+23.9% vs +22.4%). Evidence: 'EXP swp'/'EXP swp7y' rows in backtest_results.csv, findings in CLAUDE.md. Prior 55/40 evidence (2026-07-11 hand-tune) in git history. MA0 ~equal OOS; MA50 kept as downtrend-entry insurance. Note: tune's grid cannot see this combo (no deep-sell bands).",
+    "notes": "Trend MA removed (50 -> 0) on 2026-07-30 after a 7y (2555d) walk-forward sweep isolating the knob (QQQ/GLD/IWM/SPY, 70/30, COST_BPS=5): with the same 55/35 band, dropping MA50 improved OOS test avg +43.5% -> +49.0% and worst-symbol OOS +18.0% -> +31.9%, and full-account (portfolio, 25%/pos) return +124.7% -> +135.2% (CAGR +12.3 -> +13.0%) for only +1.6pts max DD (-18.1% -> -19.7%). p14 55/35 no-MA was the single most robust combo (highest worst-symbol OOS) on a plateau (55/30, 50/35, 60/30 no-MA also top-12); no-MA > MA50 > MA200 at every sell level full-window incl. the 2022 bear + 2025 downtrend. The prior 'MA50 as downtrend insurance' call came from a 3y window whose OOS period had no MA vetoes, so MA0/MA50 looked identical there; over 7y MA50 is net-negative on return for a trivial DD gain. Sell 35 and RSI-14 retained (plateau centers). Evidence: portfolio + per-symbol rows in backtest_results.csv (2026-07-29/30). PRIOR: sell deepened 40 -> 35 after the 2026-07-12 630-combo sweep (sell 30-35 beats 40 across nearly every period/band/MA and symbol on both windows; details in git history / CLAUDE.md); 55/40 from a 2026-07-11 hand-tune. Note: tune's grid cannot see the 55/35 band.",
     "settings": {
       "RSI_BUY_LEVEL": "55",
       "RSI_SELL_LEVEL": "35",
-      "TREND_MA_PERIOD": "50",
+      "TREND_MA_PERIOD": "0",
       "VOLUME_MULT": "0",
       "VOLUME_LOOKBACK": "20"
     }
