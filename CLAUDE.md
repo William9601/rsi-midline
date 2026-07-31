@@ -216,7 +216,9 @@ evidence in `backtest_results.csv`):
 
 - On 1Day, the asymmetric 55/40 band beat the tuned 60/40 out-of-sample
   (+20.7% vs +19.3% test avg) — now the profile. MA0 scored identically OOS;
-  MA50 kept as downtrend insurance.
+  MA50 kept as downtrend insurance. (SUPERSEDED 2026-07-30: on the 7y window
+  MA50 is net-negative — the trend MA was removed from the 1Day profile; see
+  the 2026-07-30 findings below.)
 - Plain RSI setups on 1Hour overfit badly (train +19.8% → test −0.6%); the
   1Day-MA50 HTF confirmation is what keeps hourly variants positive OOS.
 - A 1Hour MA50 HTF filter on 15Min bars ≈ the MA200 trend filter (both look
@@ -347,3 +349,52 @@ frictionless, `EXP *` rows in `backtest_results.csv`):
   2025 downtrend (training window) — the last-30% OOS window had no vetoes,
   so every MA50 variant scores identically OOS and the tune gate cannot
   distinguish them. HMA200 whipsaws badly (+16.7%); avoid HMA at long periods.
+
+From the 2026-07-30 daily re-tune (QQQ/GLD/IWM/SPY, 7y/2555d, 70/30
+walk-forward, COST_BPS=5; per-symbol `simulate()` + `portfolio` sim, both
+the engine `replay` proved matches live; evidence rows in
+`backtest_results.csv`, live P&L that motivated it in the journals):
+
+- **The 1Day trend MA was removed (`TREND_MA_PERIOD` 50 -> 0).** Isolating the
+  knob at a fixed 55/35 band over 7y: dropping MA50 improved OOS test avg
+  +43.5% -> +49.0% and worst-symbol OOS +18.0% -> +31.9%, and full-account
+  (portfolio, 25%/pos) return +124.7% -> +135.2% (CAGR +12.3 -> +13.0%) for
+  only +1.6pts more max DD (-18.1% -> -19.7%, still far under buy & hold's
+  -27%). `p14 55/35 no-MA` was the single most robust combo (highest
+  worst-symbol OOS) on a plateau (55/30, 50/35, 60/30 no-MA also top-12);
+  `no-MA > MA50 > MA200` at every sell level full-window incl. the 2022 bear
+  and 2025 downtrend. The old "MA50 as insurance" call was a 3y-window
+  artifact (that OOS period had no MA vetoes, so MA0/MA50 looked identical).
+  RSI-14 and sell-35 retained — both plateau centers (p21 posts big train
+  numbers but ~1 trade/yr/symbol ≈ buy & hold + crash filter; p10 churns).
+- **Expanding the universe: surgical beats broad — diversification dilutes
+  the edge.** The strategy's return is concentrated in a few strong trenders,
+  so a broad add is counterproductive: an 8-symbol diversified set
+  (SPY/QQQ/IWM/GLD/DBC/SLV/EEM/VNQ @12%) fell to +98% return vs current-4's
+  +139%. **The one clean add was DBC** (broad commodities) — the only
+  candidate both a decent trender on this strategy (+34% OOS, 54% win, 13
+  trades) AND genuinely uncorrelated to the US-equity core (SPY/QQQ/IWM all
+  crash together; adding equity like XLK ≈ QQQ just piles on correlated risk).
+  `4 + DBC @20%` (slots 25 -> 20 so all 5 fit) held return flat (+138% vs
+  +139%), cut max DD -19.7% -> -15.3% (best risk-adjusted in the test, Ret/DD
+  9.05 vs 7.04), and raised activity ~22% (8.4 -> 10.2 trades/yr). Applied to
+  the 1day instance 2026-07-30 (`deploy/env/1day.env(.example)`;
+  `SYMBOLS=QQQ,GLD,IWM,SPY,DBC`, `NOTIONAL_PCT=20`).
+- **Symbol selection is by trend-worthiness (OOS walk-forward), NOT
+  transaction volume, and NOT a live daily scanner.** Volume is only a
+  liquidity floor every large ETF clears; this strategy profits from trend
+  persistence, so a high-volume chopper just adds whipsaw. A live market
+  scanner is worse still: it can't be honestly backtested (survivorship +
+  look-ahead — "today's liquid list run backward" is biased) and it breaks
+  `replay`'s fixed-universe reconciliation. Re-select periodically OFFLINE
+  (rank a candidate pool by OOS walk-forward, commit the new `SYMBOLS` with
+  evidence) if the universe needs refreshing. Caveat on all of the above:
+  the 7y OOS window is bull-heavy, so a bare "OOS > 0" filter is too weak —
+  it failed to reject known choppers (XLE +6%, USO +7%); trust the *relative*
+  ranking and require a real diversification mechanism, not just a positive
+  number. TLT was the one outright DROP (OOS -10%).
+- **Motivating context:** the losses prompting this work were entirely
+  intraday — 1Hour (-7.0%, 82% losing) and 15Min (-7.2%, 80% losing) were
+  whipsawing live exactly as backtests predicted, while the 1Day bot had
+  barely traded. The highest-leverage fix for daily was frequency (more
+  symbols) + shedding the return-draining MA, not a new exit knob.
