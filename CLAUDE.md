@@ -6,10 +6,25 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A long-only RSI-midline trading bot for Alpaca: buy when RSI crosses above a
 level, sell when it crosses below (with optional band, trend-MA, volume,
-higher-timeframe-trend, and trailing-stop filters). Single module:
-`rsi_midline_bot.py`. Everything else is config (`profiles.json`, `.env`,
+higher-timeframe-trend, and trailing-stop filters). The **deployed** bot is one
+module: `rsi_midline_bot.py`. Everything else is config (`profiles.json`, `.env`,
 `deploy/env/`) or generated data (`trades.db`, `backtest_results.csv` — the
 append-only experiment log every backtest writes to).
+
+Three sibling **research-only** intraday bots, all built and **rejected** on
+2026-07-31 (nothing deployed), live isolated under **`intraday/`** so they can't
+clutter or interfere with the deployed day-bot: `intraday/mean_reversion_bot.py`
+(session-VWAP mean reversion), `intraday/orb_bot.py` (Opening Range Breakout),
+and `intraday/pairs_bot.py` (cross-sectional / market-neutral pairs reversion —
+the only two-sided/shorting design; live trading is a stub, it never proved out).
+They share `intraday/intraday_common.py` (one RTH-actionable mask for every
+sub-daily bot) and **import** `rsi_midline_bot.py`'s pure helpers (a one-way
+dependency — the main bot imports none of them; each moved module inserts the
+repo root on `sys.path` so the import still resolves when run as
+`python intraday/<bot>.py ...`). Each has its own Config / journal / profiles /
+`intraday/*_backtest_results.csv`. Intraday work is **concluded** — all four
+attempts (RSI-trend + these three) failed; see `docs/intraday-next-steps.md` and
+the 2026-07-31 pairs findings below.
 
 ## Commands
 
@@ -398,3 +413,91 @@ the engine `replay` proved matches live; evidence rows in
   whipsawing live exactly as backtests predicted, while the 1Day bot had
   barely traded. The highest-leverage fix for daily was frequency (more
   symbols) + shedding the return-draining MA, not a new exit knob.
+
+From the 2026-07-31 intraday strategy search (two NEW standalone bots,
+SPY/QQQ/IWM at 15Min + 5Min, 70/30 walk-forward, evidence in
+`mr_backtest_results.csv` / `orb_backtest_results.csv`). Goal: find an intraday
+edge in a *different* factor than the trend bot, which structurally whipsaws
+intraday. **Both bots were validated and REJECTED — kept as tested research
+engines, not deployed.** The engines are sound (offline checks: no look-ahead,
+RTH-actionable parity with live, flat-at-close, single-symbol sim == portfolio
+sim, frictionless reproducibility); the strategies simply have no edge.
+
+- **Mean reversion (`mean_reversion_bot.py`) — null, worse than ORB.** Buy
+  z-score dips below session VWAP (z <= -ENTRY_Z) with RSI2 oversold; exit to
+  VWAP / z-stop / % stop / session close; flat overnight; optional daily-trend
+  regime gate. **Negative even frictionless, in- AND out-of-sample**, every
+  variant/symbol/timeframe (15Min OOS -2 to -4% frictionless, -7 to -10% at
+  5bps; 5Min same-or-worse). Root cause is a **structural asymmetry**: exit-at-
+  VWAP caps each winner at ~2σ (~0.3%) while a dip that keeps falling is
+  force-closed at the session bell for a much bigger loss — ~50-57% win rate
+  but negative expectancy *before* any cost. Adding a stop made it far worse
+  (churn + realized knife-catches). The regime filter halved the loss (confirms
+  it's knife-catching in downtrends) but stayed negative. Not fixable by tuning.
+- **Opening Range Breakout (`orb_bot.py`) — null, but an in-sample tease.**
+  Define the first OR_MINUTES of RTH as the opening range; buy when a bar
+  *closes* above the range high (at most once/day); stop at OR low / % / R;
+  optional R target; flat at close. Time-anchored momentum (fires ~1x/day), so
+  it dodges the continuous-whipsaw problem. **Frictionless it shows a real
+  in-sample tendency** (train +6 to +16%, win 52-61%) **but no OOS persistence**
+  — the held-out test window is flat-to-negative *even frictionless* (-0.4 to
+  -4.7%). At 5bps, ~180 trades/yr = ~18% friction drag buries it (-7 to -18%).
+  Portfolio (25%/pos): frictionless only **+5.7% vs buy&hold +24.5%** (14% avg
+  exposure, mostly in cash); **-7.3% at 5bps**. No lever moved OOS: OR length
+  (5/15/30), stop style (OR-low / 0.5R), 2R target, or the regime gate — all
+  negative held-out. Fills are close-based (stops/targets on closes), which is
+  *optimistic* on gap-through bars, so the real result is no better.
+- **Verdict (three-for-three against intraday, later four).** RSI-trend lost
+  live, mean reversion is null, ORB is null — all confirm sub-daily is
+  **friction-bound with no durable long-only edge for this liquid-ETF retail
+  setup**. The 1Day trend bot is the edge. The two scoped escapes from that
+  design space were tried next: Option A (leveraged/high-vol + risk-based sizing)
+  was pre-checked and abandoned; Option B (cross-sectional/market-neutral) was
+  built as `pairs_bot.py` and also came up null — see the pairs findings below,
+  which close out intraday work. When re-deriving any intraday number, remember
+  fills are close-based and the 7y-bull-heavy + RTH-mask caveats apply.
+
+From the 2026-07-31 market-neutral pairs search (`pairs_bot.py`, a THIRD
+standalone intraday bot and the first two-sided/shorting design; QQQ/SPY +
+IWM/SPY at 5Min + 15Min, 365d, 70/30 walk-forward; evidence in
+`pairs_backtest_results.csv`). Goal (Option B from `docs/intraday-next-steps.md`):
+find a *relative* (spread) edge where absolute long-only bets failed, since
+SPY/QQQ/IWM crash together so a single-name bet is really one market bet. Built
+research-first per the project norm — the two-sided *edge* is fully backtestable
+by simulating both legs, so **no live shorting infra was built** (`run`/`loop`
+are stubs that refuse). **Validated and REJECTED — null, friction-bound.**
+
+- **Strategy.** Spread `s = logA − beta·logB`, beta a ROLLING OLS hedge ratio
+  (Cov/Var over BETA_LOOKBACK bars); z-score `s` over Z_LOOKBACK. z ≤ −ENTRY_Z
+  (A cheap vs B) → long A / short B; z ≥ +ENTRY_Z → short A / long B; exit on
+  reversion (|z| ≤ EXIT_Z) / blow-out stop (|z| ≥ STOP_Z) / session close (flat
+  overnight). A 3-state machine (flat / long-spread / short-spread) with
+  beta-neutral two-sided P&L quoted **on gross exposure** (|long$|+|short$|).
+- **Engine is sound** (offline `test_pairs_engine.py`: beta/z no look-ahead,
+  RTH-actionable parity, flat-at-close, 3-state correctness incl. no direct
+  long↔short flip, single-pair `simulate()` return-on-gross reconciles with the
+  two-sided `simulate_portfolio()` MTM, frictionless reproducibility).
+- **Frictionless the "edge" is economically negligible** — a fraction of a
+  percent to ~2-3% per YEAR on gross, ~50% win rate: 5Min QQQ/SPY test +1.7%,
+  IWM/SPY +0.1%; 15Min test +0.2-1.9%. Portfolio (25%/pair gross) only **+0.9%**
+  frictionless over the year at 10% avg gross exposure.
+- **At 5bps it collapses, every pair / timeframe / variant** (a pairs round trip
+  is 4 fills = 2×COST_BPS of gross; ~500 trades/yr on 5Min, ~190 on 15Min).
+  5Min test −12 to −17%, 15Min test −2 to −9%; **portfolio +0.9% → −21.7%** at
+  5bps, win rate 50% → 11%. The spread signal is far too small to clear even
+  modest friction. No lever helped (ENTRY_Z 1.5-2.5, EXIT_Z, STOP_Z, Z_LOOKBACK,
+  static β=1 vs rolling — static was worse everywhere).
+- **Hedge ratio is unstable OOS** (the overfit tell flagged in the doc): entry
+  beta drifts train→test (QQQ/SPY 1.30±0.26 → 1.63±0.43 on 15Min) with wide
+  dispersion — another reason not to trust the thin frictionless edge.
+- **Verdict (four-for-four against intraday) → intraday work is DONE.** Long-only
+  trend (live), VWAP mean reversion (null), ORB (null), and now market-neutral
+  pairs (null) all confirm this liquid-ETF retail setup is friction-bound with no
+  durable intraday edge, absolute OR relative. The 1Day trend bot is the edge —
+  do not reopen intraday without a genuinely different regime (a real transaction
+  cost advantage, higher-vol instruments with proper risk sizing, or a
+  data/latency edge none of this infra assumes). Option A (leveraged + risk
+  sizing) was pre-checked this session and left unbuilt: the ORB *signal* is
+  OOS-negative on TQQQ/SOXL/SPXL too, and since `simulate()` is 100%-invested
+  per symbol, risk-based sizing only reallocates — it can't flip a negative
+  per-trade expectancy.

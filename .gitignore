@@ -4,6 +4,7 @@ deploy/env/*.env
 
 # Trade journal — account data, not code
 trades.db
+intraday/*.db
 
 # Virtual environment
 .venv/
