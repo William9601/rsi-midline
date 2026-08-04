@@ -23,6 +23,22 @@ id -u rsibot >/dev/null 2>&1 || \
 chown -R rsibot:rsibot /opt/rsi-midline-bot
 chmod 600 deploy/env/*.env 2>/dev/null || true
 
+# Safety net: rsibot MUST be able to write this dir, or SQLite journaling
+# fails silently while the bots keep trading (a bare rsync copies the
+# client's ownership onto the server and breaks this — see deploy/push.sh).
+# The chown above fixes it; verify it here so a broken deploy fails LOUDLY
+# now instead of surfacing as unrecorded trades days later. This runs
+# BEFORE the bots start, so they never launch into a non-writable dir.
+if ! su -s /bin/sh rsibot \
+        -c 'touch /opt/rsi-midline-bot/.wtest && rm -f /opt/rsi-midline-bot/.wtest' \
+        2>/dev/null; then
+    echo "FATAL: rsibot cannot write /opt/rsi-midline-bot — SQLite journaling" >&2
+    echo "would fail silently while the bots trade. Fix and re-run:" >&2
+    echo "    chown -R rsibot:rsibot /opt/rsi-midline-bot" >&2
+    exit 1
+fi
+echo "OK: rsibot can write /opt/rsi-midline-bot (journaling healthy)."
+
 cp deploy/rsi-bot@.service /etc/systemd/system/
 # Weekly replay check: re-simulate each bot's live period, diff vs journal.
 cp deploy/rsi-replay.service deploy/rsi-replay.timer /etc/systemd/system/
