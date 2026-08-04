@@ -202,6 +202,18 @@ check that would have caught the extended-hours gap on day one). Deployed as
   produces materially different RSI signals — feed is part of the system).
   If the subscription ever lapses, fetches silently fall back to IEX — the
   "volumes are a small unreliable slice" free-tier caveat would then apply.
+  **The SIP subscription is a running cost of LIVE operation, not a
+  backtest-only cost** (`loop`/`run` fetch SIP bars every pass to compute the
+  RSI signals — the price series *is* the strategy). Only safe to cancel if the
+  bot is being **retired**; while it trades, keep it. Quantified 2026-08-02 on
+  the deployed 1Day config (55/35, QQQ/GLD/IWM/SPY/DBC, 7y frictionless,
+  scratchpad-only — CSV not polluted): SIP->IEX dropped every symbol's return
+  34-108 pts (QQQ +188.5%->+80.0%, SPY +180.5%->+103.2%) and shifted trade
+  counts (crosses fire on different bars). Even buy & hold diverged (QQQ
+  +298%->+174%), largely because IEX returned 7554 bars vs SIP's 8785 (~1yr
+  less depth/symbol). And since orders fill at real *consolidated* prices
+  regardless of data tier, an IEX-driven live bot decides on thin prices but
+  fills elsewhere — a double mismatch that also breaks `replay` reconciliation.
 - Intraday bars cover the extended 4am–8pm ET session. Off-hours bars are
   real consolidated prints on SIP, but live still can't act on them (market
   closed) — the `RTH_ONLY` mask is about market hours, not feed quality.

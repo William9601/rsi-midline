@@ -22,18 +22,26 @@ no code or config changes on the server.
    trade). Give each bot its own paper account, or non-overlapping `SYMBOLS`.
    Real env files are gitignored; only `.example` files are committed.
 
-3. **Copy the repo and provision:**
+3. **Copy the repo and provision — always with `push.sh`:**
 
    ```bash
-   rsync -a --exclude .venv --exclude .env --exclude 'trades*.db' \
-       ./ root@SERVER:/opt/rsi-midline-bot/
-   ssh root@SERVER 'bash /opt/rsi-midline-bot/deploy/setup.sh'
+   bash deploy/push.sh root@SERVER
    ```
 
-   The script installs Python deps, creates a no-login `rsibot` user, locks
-   env-file permissions, and enables `rsi-bot@<name>` for every
-   `deploy/env/<name>.env` — enabled services start on boot, `Restart=always`
-   revives them after crashes.
+   This rsyncs the repo (excluding `.venv`, `.env`, `trades*.db`) and then
+   runs `setup.sh` on the server, as one atomic step. `setup.sh` installs
+   Python deps, creates a no-login `rsibot` user, locks env-file permissions,
+   fixes ownership, verifies `rsibot` can write the dir, and enables
+   `rsi-bot@<name>` for every `deploy/env/<name>.env` — enabled services start
+   on boot, `Restart=always` revives them after crashes.
+
+   > ⚠️ **Never run a bare `rsync` to the server.** rsync copies your Mac's
+   > file ownership onto `/opt/rsi-midline-bot`, leaving it unwritable by
+   > `rsibot`. SQLite journaling then fails on *every* write while the bots
+   > keep trading — so trades execute **unrecorded** and silently, and the
+   > journals drift out of sync with the live accounts (this happened
+   > 2026-07-13 and 2026-07-30). `push.sh` always re-runs `setup.sh`, which
+   > re-chowns and self-checks writability, so the safe path is the only path.
 
 ## Day-to-day
 
@@ -47,9 +55,10 @@ ssh root@SERVER -t 'cd /opt/rsi-midline-bot && \
 ssh root@SERVER systemctl stop rsi-bot@1hour            # pause one bot
 ```
 
-To ship code/profile changes: re-run the same `rsync` + `setup.sh` pair
-(idempotent; restarts the bots). Restarts are safe mid-day — signals are
-edge-triggered and entry/exit skip when the position already matches.
+To ship code/profile changes: re-run `bash deploy/push.sh root@SERVER`
+(idempotent; re-chowns, self-checks writability, restarts the bots).
+Restarts are safe mid-day — signals are edge-triggered and entry/exit skip
+when the position already matches.
 
 ## Weekly replay check (live vs backtest)
 
